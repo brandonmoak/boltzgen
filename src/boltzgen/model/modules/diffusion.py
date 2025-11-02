@@ -389,9 +389,11 @@ class AtomDiffusion(Module):
                 )
             
             # Initialize stability predictor
+            # Note: device will be synchronized with main model during inference
+            # Initialize on CPU first, will be moved to GPU when model is moved by PyTorch Lightning
             self.stability_predictor = TAPEStabilityPredictor(
                 checkpoint_path=tape_checkpoint_path,
-                device=self.device,
+                device="cuda" if torch.cuda.is_available() else "cpu",
             )
             
             # Initialize property steering
@@ -752,6 +754,16 @@ class AtomDiffusion(Module):
         res_type_logits = net_out["res_type"]  # (batch, num_tokens, num_token_types)
         
         try:
+            # Ensure stability predictor is on the same device as the main model
+            model_device = self.device
+            predictor_device = next(self.stability_predictor.parameters()).device
+            if predictor_device != model_device:
+                self.stability_predictor = self.stability_predictor.to(model_device)
+                # Verify device placement
+                if torch.cuda.is_available():
+                    assert next(self.stability_predictor.parameters()).device.type == "cuda", \
+                        f"Stability predictor should be on CUDA but is on {next(self.stability_predictor.parameters()).device}"
+            
             # Extract sequence from predicted residue types
             sequence = extract_designed_chain_sequence(res_type_logits, feats)
             

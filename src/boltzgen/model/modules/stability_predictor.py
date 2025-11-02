@@ -42,12 +42,12 @@ class TAPEStabilityPredictor(nn.Module):
         
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+        initial_device = torch.device(device)
         
         # Load TAPE model
         if checkpoint_path is not None:
             # Load from specific checkpoint
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(checkpoint_path, map_location=initial_device)
             config = ProteinBertConfig(**checkpoint["model_config"])
             self.model = ProteinBertModel(config)
             self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -56,13 +56,13 @@ class TAPEStabilityPredictor(nn.Module):
             # model_name can be a pretrained model name or path
             self.model = ProteinBertModel.from_pretrained(model_name)
         
-        self.model = self.model.to(self.device)
+        self.model = self.model.to(initial_device)
         self.model.eval()
         
         # Add a regression head for stability prediction
         # TAPE's transformer outputs embeddings of size config.hidden_size
         hidden_size = self.model.config.hidden_size
-        self.stability_head = nn.Linear(hidden_size, 1).to(self.device)
+        self.stability_head = nn.Linear(hidden_size, 1).to(initial_device)
         
         # Initialize stability head weights
         nn.init.xavier_uniform_(self.stability_head.weight)
@@ -71,6 +71,11 @@ class TAPEStabilityPredictor(nn.Module):
         # Note: In practice, you may need to load pre-trained weights for the
         # stability head if TAPE provides them separately
         
+    @property
+    def device(self):
+        """Get the device of the model parameters."""
+        return next(self.model.parameters()).device
+    
     def forward(self, sequence: str) -> float:
         """Predict stability for a given amino acid sequence.
         
@@ -84,6 +89,9 @@ class TAPEStabilityPredictor(nn.Module):
         float
             Predicted stability score (scalar value).
         """
+        # Get current device from model (handles device changes)
+        device = self.device
+        
         # Convert sequence to token IDs
         # TAPE uses its own tokenizer
         tokenizer = TAPETokenizer()
@@ -91,11 +99,11 @@ class TAPEStabilityPredictor(nn.Module):
         # Handle numpy array or list from tokenizer
         if isinstance(token_ids, np.ndarray):
             token_ids = torch.tensor(
-                token_ids, device=self.device, dtype=torch.long
+                token_ids, device=device, dtype=torch.long
             ).unsqueeze(0)
         else:
             token_ids = torch.tensor(
-                [token_ids], device=self.device, dtype=torch.long
+                [token_ids], device=device, dtype=torch.long
             )
         
         # Get model output
