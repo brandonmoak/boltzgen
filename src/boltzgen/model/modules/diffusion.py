@@ -18,6 +18,9 @@ from typing import Any, Dict, Optional, List
 from tqdm import tqdm
 import boltzgen.model.layers.initialize as init
 from boltzgen.data import const
+from boltzgen.model.modules.property_steering import PropertySteering, CombinedPropertySteering
+from boltzgen.model.modules.stability_predictor import TAPEStabilityPredictor
+from boltzgen.utils.sequence_extraction import extract_designed_chain_sequence
 from boltzgen.model.layers.miniformer import MiniformerModule
 from boltzgen.model.layers.pairformer import PairformerModule
 from boltzgen.model.loss.diffusion import (
@@ -301,8 +304,23 @@ class AtomDiffusion(Module):
         time_dilation_start: float = 0.6,
         time_dilation_end: float = 0.8,
         pred_threshold: Optional[float] = None,
+        # Property steering parameters
+        enable_property_steering: bool = False,
+        target_stability: Optional[float] = None,
+        stability_bias_weight: float = 1.0,
+        stability_bias_temperature: float = 1.0,
+        steering_update_freq: int = 1,
+        use_atom_bias: bool = True,
+        use_token_bias: bool = False,
+        tape_checkpoint_path: Optional[str] = None,
     ):
         super().__init__()
+        
+        # Force predict_res_type to be True when steering is enabled
+        if enable_property_steering:
+            score_model_args = dict(score_model_args)  # Make a copy
+            score_model_args["predict_res_type"] = True
+        
         self.score_model = DiffusionModule(
             **score_model_args,
         )
@@ -355,6 +373,48 @@ class AtomDiffusion(Module):
         self.pass_resolved_mask_diff_train = pass_resolved_mask_diff_train
         self.token_s = score_model_args["token_s"]
 
+        # Property steering setup
+        self.enable_property_steering = enable_property_steering
+        self.target_stability = target_stability
+        self.stability_bias_weight = stability_bias_weight
+        self.stability_bias_temperature = stability_bias_temperature
+        self.steering_update_freq = steering_update_freq
+        self.use_atom_bias = use_atom_bias
+        self.use_token_bias = use_token_bias
+        
+        if self.enable_property_steering:
+            if self.target_stability is None:
+                raise ValueError(
+                    "target_stability must be provided when enable_property_steering=True"
+                )
+            
+            # Initialize stability predictor
+            self.stability_predictor = TAPEStabilityPredictor(
+                checkpoint_path=tape_checkpoint_path,
+                device=self.device,
+            )
+            
+            # Initialize property steering
+            atom_decoder_depth = score_model_args.get("atom_decoder_depth", 3)
+            atom_decoder_heads = score_model_args.get("atom_decoder_heads", 4)
+            token_transformer_depth = score_model_args.get("token_transformer_depth", 6)
+            token_transformer_heads = score_model_args.get("token_transformer_heads", 8)
+            
+            self.property_steering = CombinedPropertySteering(
+                target_property=self.target_stability,
+                bias_weight=self.stability_bias_weight,
+                temperature=self.stability_bias_temperature,
+                atom_decoder_depth=atom_decoder_depth,
+                atom_decoder_heads=atom_decoder_heads,
+                token_transformer_depth=token_transformer_depth,
+                token_transformer_heads=token_transformer_heads,
+                use_atom_bias=self.use_atom_bias,
+                use_token_bias=self.use_token_bias,
+            )
+        else:
+            self.stability_predictor = None
+            self.property_steering = None
+
         self.register_buffer("zero", torch.tensor(0.0), persistent=False)
 
     @property
@@ -400,6 +460,29 @@ class AtomDiffusion(Module):
             noised_atom_coords = noised_atom_coords * res_mask.repeat_interleave(
                 network_condition_kwargs["multiplicity"], 0
             )
+
+        # Merge property bias into diffusion_conditioning if present
+        if "property_bias" in network_condition_kwargs:
+            property_bias = network_condition_kwargs.pop("property_bias")
+            if "diffusion_conditioning" in network_condition_kwargs:
+                diffusion_conditioning = network_condition_kwargs["diffusion_conditioning"]
+                # Merge biases
+                if "atom_dec_bias" in property_bias:
+                    existing = diffusion_conditioning.get("atom_dec_bias")
+                    if existing is not None:
+                        prop_bias = property_bias["atom_dec_bias"]
+                        prop_bias = prop_bias.to(existing.device).to(existing.dtype)
+                        diffusion_conditioning["atom_dec_bias"] = existing + prop_bias
+                    else:
+                        diffusion_conditioning["atom_dec_bias"] = property_bias["atom_dec_bias"]
+                if "token_trans_bias" in property_bias:
+                    existing = diffusion_conditioning.get("token_trans_bias")
+                    if existing is not None:
+                        prop_bias = property_bias["token_trans_bias"]
+                        prop_bias = prop_bias.to(existing.device).to(existing.dtype)
+                        diffusion_conditioning["token_trans_bias"] = existing + prop_bias
+                    else:
+                        diffusion_conditioning["token_trans_bias"] = property_bias["token_trans_bias"]
 
         net_out = self.score_model(
             r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
@@ -597,6 +680,24 @@ class AtomDiffusion(Module):
                         **network_condition_kwargs,
                     ),
                 )
+            
+            # Compute property-based bias if steering is enabled
+            # We use the res_type predictions from net_out
+            property_bias = {}
+            if (
+                self.enable_property_steering
+                and step_idx % self.steering_update_freq == 0
+                and net_out.get("res_type") is not None
+            ):
+                property_bias = self._compute_property_bias(
+                    net_out,
+                    network_condition_kwargs,
+                    multiplicity,
+                )
+            
+            # Store property bias for merging in next iteration's forward pass
+            if property_bias:
+                network_condition_kwargs["property_bias"] = property_bias
 
             if self.alignment_reverse_diff:
                 with torch.autocast("cuda", enabled=False):
@@ -617,16 +718,74 @@ class AtomDiffusion(Module):
 
             coords_traj.append(atom_coords_next)
             x0_coords_traj.append(atom_coords_denoised)
-            atom_coords = atom_coords_next
-        coords_traj.append(atom_coords)
 
-        result = dict(
-            sample_atom_coords=atom_coords,
-            coords_traj=coords_traj,
-            x0_coords_traj=x0_coords_traj,
-        )
-
-        return result
+        return {
+            "sample_atom_coords": atom_coords_next,
+            "coords_traj": coords_traj,
+            "x0_coords_traj": x0_coords_traj,
+        }
+    
+    def _compute_property_bias(
+        self,
+        net_out: dict,
+        network_condition_kwargs: dict,
+        multiplicity: int,
+    ) -> dict[str, torch.Tensor]:
+        """Compute property-based bias from current predicted sequence.
+        
+        Parameters
+        ----------
+        net_out : dict
+            Output from the diffusion model forward pass, containing 'res_type'.
+        network_condition_kwargs : dict
+            Dictionary containing network conditioning information, including 'feats'.
+        multiplicity : int
+            Multiplicity factor for batched generation.
+            
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary containing property-based bias tensors.
+            Keys: 'atom_dec_bias', 'token_trans_bias' (as configured).
+        """
+        feats = network_condition_kwargs["feats"]
+        res_type_logits = net_out["res_type"]  # (batch, num_tokens, num_token_types)
+        
+        try:
+            # Extract sequence from predicted residue types
+            sequence = extract_designed_chain_sequence(res_type_logits, feats)
+            
+            if sequence is None or len(sequence) == 0:
+                # No valid sequence extracted
+                return {}
+            
+            # Predict stability
+            predicted_stability = self.stability_predictor(sequence)
+            
+            # Get tensor dimensions from feats
+            num_atoms = feats["atom_pad_mask"].shape[-1] if self.use_atom_bias else None
+            num_tokens = feats["token_pad_mask"].shape[-1] if self.use_token_bias else None
+            batch_size = feats["token_pad_mask"].shape[0] // multiplicity
+            
+            # Generate bias terms
+            biases = self.property_steering(
+                predicted_property=predicted_stability,
+                num_atoms=num_atoms,
+                num_tokens=num_tokens,
+                batch_size=batch_size,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            
+            return biases
+            
+        except Exception as e:
+            # If property prediction fails, raise the error
+            # We don't want silent failures that hide bugs
+            raise RuntimeError(
+                f"Failed to compute property bias: {e}"
+            ) from e
+    
 
     # training
     def loss_weight(self, sigma):

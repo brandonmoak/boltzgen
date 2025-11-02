@@ -1,0 +1,13 @@
+entities:
+  - file:
+      path: ../example/vanilla_protein/1g13.cif
+      include:
+        - chain:
+            id: A
+      # Mask a region for design (e.g., residues 20-40)
+      # Adjust res_index based on actual protein length
+      design:
+        - chain:
+            id: A
+            res_index: 20..40  # Design residues 20-40, rest stays fixed
+
