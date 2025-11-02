@@ -31,7 +31,10 @@ boltzgen run "$DESIGN_SPEC" \
     --num_designs $NUM_DESIGNS \
     --protocol protein-anything \
     --steps design \
-    --no_subprocess
+    --no_subprocess \
+    --devices 1 \
+    --config design trainer.accelerator=gpu \
+    --config design trainer.devices=1
 
 # Step 2: Generate samples with high stability steering
 echo ""
@@ -42,6 +45,9 @@ boltzgen run "$DESIGN_SPEC" \
     --protocol protein-anything \
     --steps design \
     --no_subprocess \
+    --devices 1 \
+    --config design trainer.accelerator=gpu \
+    --config design trainer.devices=1 \
     --config diffusion_process_args.enable_property_steering=true \
     --config diffusion_process_args.target_stability=0.8 \
     --config diffusion_process_args.stability_bias_weight=1.0 \
@@ -56,6 +62,9 @@ boltzgen run "$DESIGN_SPEC" \
     --protocol protein-anything \
     --steps design \
     --no_subprocess \
+    --devices 1 \
+    --config design trainer.accelerator=gpu \
+    --config design trainer.devices=1 \
     --config diffusion_process_args.enable_property_steering=true \
     --config diffusion_process_args.target_stability=-0.5 \
     --config diffusion_process_args.stability_bias_weight=1.0 \
