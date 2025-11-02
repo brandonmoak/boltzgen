@@ -1040,6 +1040,18 @@ class AtomDiffusion(Module):
             num_tokens = feats["token_pad_mask"].shape[-1] if self.use_token_bias else None
             batch_size = feats["token_pad_mask"].shape[0] // multiplicity
             
+            # Get target shapes from existing biases in diffusion_conditioning (if available)
+            atom_dec_bias_shape = None
+            token_trans_bias_shape = None
+            if "diffusion_conditioning" in network_condition_kwargs:
+                dc = network_condition_kwargs["diffusion_conditioning"]
+                if self.use_atom_bias and "atom_dec_bias" in dc:
+                    existing_atom_bias = dc["atom_dec_bias"]
+                    atom_dec_bias_shape = existing_atom_bias.shape
+                if self.use_token_bias and "token_trans_bias" in dc:
+                    existing_token_bias = dc["token_trans_bias"]
+                    token_trans_bias_shape = existing_token_bias.shape
+            
             # Generate bias terms
             biases = self.property_steering(
                 predicted_property=predicted_stability,
@@ -1048,6 +1060,8 @@ class AtomDiffusion(Module):
                 batch_size=batch_size,
                 device=self.device,
                 dtype=torch.float32,
+                atom_dec_bias_shape=atom_dec_bias_shape,
+                token_trans_bias_shape=token_trans_bias_shape,
             )
             
             return biases

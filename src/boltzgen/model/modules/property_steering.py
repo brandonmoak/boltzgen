@@ -119,6 +119,7 @@ class PropertySteering(Module):
         batch_size: int = 1,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
+        target_shape: Optional[tuple[int, ...]] = None,
     ) -> torch.Tensor:
         """Generate bias tensor for given property prediction.
         
@@ -136,6 +137,10 @@ class PropertySteering(Module):
             Device for the bias tensor. If None, uses CPU.
         dtype : torch.dtype, default=torch.float32
             Data type for the bias tensor.
+        target_shape : tuple[int, ...], optional
+            Target shape for the bias tensor. If provided, this shape is used
+            directly instead of calculating from num_layers and num_heads.
+            Should be (batch, dim1, dim2, num_heads).
             
         Returns
         -------
@@ -149,7 +154,10 @@ class PropertySteering(Module):
         if device is None:
             device = torch.device("cpu")
         
-        if self.bias_type == "atom_dec_bias":
+        if target_shape is not None:
+            # Use the provided target shape directly
+            shape = target_shape
+        elif self.bias_type == "atom_dec_bias":
             if num_atoms is None:
                 raise ValueError("num_atoms required for atom_dec_bias")
             
@@ -165,6 +173,8 @@ class PropertySteering(Module):
             # Shape: (batch, num_tokens, num_tokens, num_heads_per_layer)
             num_heads_per_layer = self.num_layers * self.num_heads
             shape = (batch_size, num_tokens, num_tokens, num_heads_per_layer)
+        else:
+            raise ValueError(f"Invalid bias_type: {self.bias_type}")
         
         bias = self.compute_bias_from_property(
             predicted_property=predicted_property,
@@ -243,8 +253,17 @@ class CombinedPropertySteering(Module):
         batch_size: int = 1,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
+        atom_dec_bias_shape: Optional[tuple[int, ...]] = None,
+        token_trans_bias_shape: Optional[tuple[int, ...]] = None,
     ) -> dict[str, torch.Tensor]:
         """Generate both bias types.
+        
+        Parameters
+        ----------
+        atom_dec_bias_shape : tuple[int, ...], optional
+            Target shape for atom_dec_bias. If provided, overrides calculated shape.
+        token_trans_bias_shape : tuple[int, ...], optional
+            Target shape for token_trans_bias. If provided, overrides calculated shape.
         
         Returns
         -------
@@ -262,6 +281,7 @@ class CombinedPropertySteering(Module):
                 batch_size=batch_size,
                 device=device,
                 dtype=dtype,
+                target_shape=atom_dec_bias_shape,
             )
         
         if self.use_token_bias:
@@ -271,6 +291,7 @@ class CombinedPropertySteering(Module):
                 batch_size=batch_size,
                 device=device,
                 dtype=dtype,
+                target_shape=token_trans_bias_shape,
             )
         
         return biases
