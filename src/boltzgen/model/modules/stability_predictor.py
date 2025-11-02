@@ -96,7 +96,7 @@ class TAPEStabilityPredictor(nn.Module):
         # Get current device from model (handles device changes)
         device = self.device
         
-        # Profile tokenization
+        # Profile tokenization (CPU operation, no sync needed)
         tok_start = time.time()
         # Convert sequence to token IDs using pre-initialized tokenizer
         token_ids = self.tokenizer.encode(sequence)
@@ -111,7 +111,9 @@ class TAPEStabilityPredictor(nn.Module):
             )
         tok_time = time.time() - tok_start
         
-        # Get model output
+        # Get model output (with GPU sync for accurate timing)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         model_start = time.time()
         with torch.no_grad():
             output = self.model(token_ids)
@@ -137,11 +139,14 @@ class TAPEStabilityPredictor(nn.Module):
                     sequence_repr = output
             
             # Predict stability
-            head_start = time.time()
             stability = self.stability_head(sequence_repr)
             stability_score = stability.item()
-            head_time = time.time() - head_start
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         model_time = time.time() - model_start
+        
+        # Head time is included in model_time, separate measurement not needed
+        head_time = 0.0  # Included in model_time above
         
         # Print detailed timing (only first few calls to avoid spam)
         if not hasattr(self, '_call_count'):

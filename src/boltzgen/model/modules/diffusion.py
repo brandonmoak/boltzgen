@@ -680,7 +680,9 @@ class AtomDiffusion(Module):
             eps = noise_scale * sqrt(noise_var) * torch.randn(shape, device=self.device)
             atom_coords_noisy = atom_coords + eps
 
-            # Profile forward pass
+            # Profile forward pass (with GPU sync for accurate timing)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             forward_start = time.time()
             with torch.no_grad():
                 atom_coords_denoised, net_out = self.preconditioned_network_forward(
@@ -692,6 +694,8 @@ class AtomDiffusion(Module):
                         **network_condition_kwargs,
                     ),
                 )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             total_forward_time += time.time() - forward_start
             
             # Compute property-based bias if steering is enabled
@@ -702,12 +706,16 @@ class AtomDiffusion(Module):
                 and step_idx % self.steering_update_freq == 0
                 and net_out.get("res_type") is not None
             ):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 steering_start = time.time()
                 property_bias = self._compute_property_bias(
                     net_out,
                     network_condition_kwargs,
                     multiplicity,
                 )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
                 steering_time = time.time() - steering_start
                 total_steering_time += steering_time
                 steering_call_count += 1
@@ -738,7 +746,9 @@ class AtomDiffusion(Module):
             coords_traj.append(atom_coords_next)
             x0_coords_traj.append(atom_coords_denoised)
 
-        # Print profiling summary
+        # Print profiling summary (sync before final measurement)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         total_time = time.time() - start_time
         print(f"\n[Profiling Summary] Total diffusion time: {total_time:.2f}s")
         forward_pct = 100 * total_forward_time / total_time if total_time > 0 else 0
