@@ -29,7 +29,9 @@ echo "Step 1: Generating samples with NO steering (baseline)..."
 boltzgen run "$DESIGN_SPEC" \
     --output validation_steering/no_steering \
     --num_designs $NUM_DESIGNS \
-    --protocol protein-anything
+    --protocol protein-anything \
+    --steps design \
+    --no_subprocess
 
 # Step 2: Generate samples with high stability steering
 echo ""
@@ -38,6 +40,8 @@ boltzgen run "$DESIGN_SPEC" \
     --output validation_steering/high_stability \
     --num_designs $NUM_DESIGNS \
     --protocol protein-anything \
+    --steps design \
+    --no_subprocess \
     --config diffusion_process_args.enable_property_steering=true \
     --config diffusion_process_args.target_stability=0.8 \
     --config diffusion_process_args.stability_bias_weight=1.0 \
@@ -50,6 +54,8 @@ boltzgen run "$DESIGN_SPEC" \
     --output validation_steering/low_stability \
     --num_designs $NUM_DESIGNS \
     --protocol protein-anything \
+    --steps design \
+    --no_subprocess \
     --config diffusion_process_args.enable_property_steering=true \
     --config diffusion_process_args.target_stability=-0.5 \
     --config diffusion_process_args.stability_bias_weight=1.0 \
