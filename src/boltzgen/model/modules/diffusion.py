@@ -449,6 +449,10 @@ class AtomDiffusion(Module):
     ):
         batch, device = noised_atom_coords.shape[0], noised_atom_coords.device
 
+        # Profile preprocessing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        prep_start = time.time()
         if isinstance(sigma, float):
             sigma = torch.full((batch,), sigma, device=device)
 
@@ -486,17 +490,48 @@ class AtomDiffusion(Module):
                         diffusion_conditioning["token_trans_bias"] = existing + prop_bias
                     else:
                         diffusion_conditioning["token_trans_bias"] = property_bias["token_trans_bias"]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        prep_time = time.time() - prep_start
+        
+        # Store timing if profiling is enabled
+        if hasattr(self, '_profile_forward'):
+            if not hasattr(self, '_total_preprocessing_time'):
+                self._total_preprocessing_time = 0.0
+                self._total_score_model_time = 0.0
+                self._total_postprocessing_time = 0.0
+            self._total_preprocessing_time += prep_time
 
+        # Profile score_model call
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        model_start = time.time()
         net_out = self.score_model(
             r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
             times=self.c_noise(sigma),
             **network_condition_kwargs,
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        model_time = time.time() - model_start
+        
+        if hasattr(self, '_profile_forward'):
+            self._total_score_model_time += model_time
 
+        # Profile postprocessing
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        post_start = time.time()
         denoised_coords = (
             self.c_skip(padded_sigma) * noised_atom_coords
             + self.c_out(padded_sigma) * net_out["r_update"]
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        post_time = time.time() - post_start
+        
+        if hasattr(self, '_profile_forward'):
+            self._total_postprocessing_time += post_time
 
         return denoised_coords, net_out
 
@@ -649,6 +684,13 @@ class AtomDiffusion(Module):
         total_forward_time = 0.0
         total_steering_time = 0.0
         steering_call_count = 0
+        # Granular profiling
+        total_coord_ops_time = 0.0
+        total_preprocessing_time = 0.0
+        total_score_model_time = 0.0
+        total_postprocessing_time = 0.0
+        total_alignment_time = 0.0
+        total_update_time = 0.0
         start_time = time.time()
         
         for step_idx, (
@@ -667,6 +709,10 @@ class AtomDiffusion(Module):
             t_hat = sigma_tm * (1 + gamma)
             noise_var = noise_scale**2 * (t_hat**2 - sigma_tm**2)
 
+            # Profile coordinate operations
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            coord_ops_start = time.time()
             atom_coords = center(atom_coords, atom_mask)
 
             if self.coordinate_augmentation_inference:
@@ -679,8 +725,13 @@ class AtomDiffusion(Module):
 
             eps = noise_scale * sqrt(noise_var) * torch.randn(shape, device=self.device)
             atom_coords_noisy = atom_coords + eps
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_coord_ops_time += time.time() - coord_ops_start
 
             # Profile forward pass (with GPU sync for accurate timing)
+            # Enable profiling flag for preconditioned_network_forward
+            self._profile_forward = True
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             forward_start = time.time()
@@ -697,6 +748,15 @@ class AtomDiffusion(Module):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             total_forward_time += time.time() - forward_start
+            # Accumulate detailed timings from preconditioned_network_forward
+            if hasattr(self, '_total_preprocessing_time'):
+                total_preprocessing_time += self._total_preprocessing_time
+                total_score_model_time += self._total_score_model_time
+                total_postprocessing_time += self._total_postprocessing_time
+                # Reset for next iteration
+                self._total_preprocessing_time = 0.0
+                self._total_score_model_time = 0.0
+                self._total_postprocessing_time = 0.0
             
             # Compute property-based bias if steering is enabled
             # We use the res_type predictions from net_out
@@ -726,7 +786,11 @@ class AtomDiffusion(Module):
             if property_bias:
                 network_condition_kwargs["property_bias"] = property_bias
 
+            # Profile alignment
             if self.alignment_reverse_diff:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                align_start = time.time()
                 with torch.autocast("cuda", enabled=False):
                     atom_coords_noisy = weighted_rigid_align(
                         atom_coords_noisy.float(),
@@ -736,7 +800,14 @@ class AtomDiffusion(Module):
                     )
 
                 atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                total_alignment_time += time.time() - align_start
 
+            # Profile coordinate updates
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            update_start = time.time()
             # note here I believe there is a mistake in the AF3 paper where they use atom_coords instead of atom_coords_noisy
             denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
             atom_coords_next = (
@@ -745,24 +816,63 @@ class AtomDiffusion(Module):
 
             coords_traj.append(atom_coords_next)
             x0_coords_traj.append(atom_coords_denoised)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_update_time += time.time() - update_start
 
         # Print profiling summary (sync before final measurement)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         total_time = time.time() - start_time
+        
+        # Print GPU information
+        if torch.cuda.is_available():
+            device_id = self.device.index if self.device.index is not None else 0
+            gpu_name = torch.cuda.get_device_name(device_id)
+            print(f"\n[Device Info] Using GPU: {gpu_name} (device {device_id})")
+        else:
+            print(f"\n[Device Info] Using CPU")
+        
         print(f"\n[Profiling Summary] Total diffusion time: {total_time:.2f}s")
+        print(f"\n  === Breakdown by operation ===")
+        
+        # Forward pass breakdown
         forward_pct = 100 * total_forward_time / total_time if total_time > 0 else 0
-        print(f"  - Forward pass time: {total_forward_time:.2f}s ({forward_pct:.1f}%)")
+        print(f"  Forward pass (total): {total_forward_time:.2f}s ({forward_pct:.1f}%)")
+        if total_preprocessing_time > 0:
+            prep_pct = 100 * total_preprocessing_time / total_time if total_time > 0 else 0
+            print(f"    - Preprocessing: {total_preprocessing_time:.2f}s ({prep_pct:.1f}%)")
+        if total_score_model_time > 0:
+            model_pct = 100 * total_score_model_time / total_time if total_time > 0 else 0
+            print(f"    - Score model: {total_score_model_time:.2f}s ({model_pct:.1f}%)")
+        if total_postprocessing_time > 0:
+            post_pct = 100 * total_postprocessing_time / total_time if total_time > 0 else 0
+            print(f"    - Postprocessing: {total_postprocessing_time:.2f}s ({post_pct:.1f}%)")
+        
+        # Loop overhead breakdown
+        if total_coord_ops_time > 0:
+            coord_pct = 100 * total_coord_ops_time / total_time if total_time > 0 else 0
+            print(f"  Coordinate operations: {total_coord_ops_time:.2f}s ({coord_pct:.1f}%)")
         if self.enable_property_steering:
             steering_pct = 100 * total_steering_time / total_time if total_time > 0 else 0
-            print(f"  - Steering time: {total_steering_time:.2f}s ({steering_pct:.1f}%)")
-            print(f"  - Steering calls: {steering_call_count}")
+            print(f"  Steering: {total_steering_time:.2f}s ({steering_pct:.1f}%)")
+            print(f"    - Steering calls: {steering_call_count}")
             if steering_call_count > 0:
                 avg_steering = total_steering_time / steering_call_count * 1000
-                print(f"  - Avg steering time per call: {avg_steering:.2f}ms")
-        other_time = total_time - total_forward_time - total_steering_time
+                print(f"    - Avg steering time per call: {avg_steering:.2f}ms")
+        if total_alignment_time > 0:
+            align_pct = 100 * total_alignment_time / total_time if total_time > 0 else 0
+            print(f"  Alignment: {total_alignment_time:.2f}s ({align_pct:.1f}%)")
+        if total_update_time > 0:
+            update_pct = 100 * total_update_time / total_time if total_time > 0 else 0
+            print(f"  Coordinate updates: {total_update_time:.2f}s ({update_pct:.1f}%)")
+        
+        # Other overhead
+        accounted_time = (total_forward_time + total_steering_time + total_coord_ops_time + 
+                         total_alignment_time + total_update_time)
+        other_time = total_time - accounted_time
         other_pct = 100 * other_time / total_time if total_time > 0 else 0
-        print(f"  - Other overhead: {other_time:.2f}s ({other_pct:.1f}%)\n")
+        print(f"  Other overhead: {other_time:.2f}s ({other_pct:.1f}%)\n")
         
         return {
             "sample_atom_coords": atom_coords_next,
