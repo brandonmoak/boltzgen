@@ -43,6 +43,9 @@ NUM_DESIGNS=50
 # Step 1: Generate samples with no steering
 if [ "$START_STEP" -le 1 ]; then
     echo "Step 1: Generating samples with NO steering (baseline)..."
+    # Copy the no-steering config to design.yaml in a temp location
+    TEMP_CONFIG_DIR=$(mktemp -d)
+    cp validation_steering/design_no_steering.yaml "$TEMP_CONFIG_DIR/design.yaml"
     boltzgen run "$DESIGN_SPEC" \
         --output validation_steering/no_steering \
         --num_designs $NUM_DESIGNS \
@@ -50,16 +53,19 @@ if [ "$START_STEP" -le 1 ]; then
         --steps design \
         --no_subprocess \
         --devices 1 \
-        --config_dir validation_steering \
-        --config design=design_no_steering \
+        --config_dir "$TEMP_CONFIG_DIR" \
         --config design trainer.accelerator=gpu \
         --config design trainer.devices=1
+    rm -rf "$TEMP_CONFIG_DIR"
 fi
 
 # Step 2: Generate samples with high stability steering
 if [ "$START_STEP" -le 2 ]; then
     echo ""
     echo "Step 2: Generating samples with HIGH stability steering..."
+    # Copy the high-stability config to design.yaml in a temp location
+    TEMP_CONFIG_DIR=$(mktemp -d)
+    cp validation_steering/design_high_stability.yaml "$TEMP_CONFIG_DIR/design.yaml"
     boltzgen run "$DESIGN_SPEC" \
         --output validation_steering/high_stability \
         --num_designs $NUM_DESIGNS \
@@ -67,16 +73,19 @@ if [ "$START_STEP" -le 2 ]; then
         --steps design \
         --no_subprocess \
         --devices 1 \
-        --config_dir validation_steering \
-        --config design=design_high_stability \
+        --config_dir "$TEMP_CONFIG_DIR" \
         --config design trainer.accelerator=gpu \
         --config design trainer.devices=1
+    rm -rf "$TEMP_CONFIG_DIR"
 fi
 
 # Step 3: Generate samples with low stability steering
 if [ "$START_STEP" -le 3 ]; then
     echo ""
     echo "Step 3: Generating samples with LOW stability steering..."
+    # Copy the low-stability config to design.yaml in a temp location
+    TEMP_CONFIG_DIR=$(mktemp -d)
+    cp validation_steering/design_low_stability.yaml "$TEMP_CONFIG_DIR/design.yaml"
     boltzgen run "$DESIGN_SPEC" \
         --output validation_steering/low_stability \
         --num_designs $NUM_DESIGNS \
@@ -84,10 +93,10 @@ if [ "$START_STEP" -le 3 ]; then
         --steps design \
         --no_subprocess \
         --devices 1 \
-        --config_dir validation_steering \
-        --config design=design_low_stability \
+        --config_dir "$TEMP_CONFIG_DIR" \
         --config design trainer.accelerator=gpu \
         --config design trainer.devices=1
+    rm -rf "$TEMP_CONFIG_DIR"
 fi
 
 # Step 4: Extract sequences
