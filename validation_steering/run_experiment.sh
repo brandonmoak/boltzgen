@@ -51,7 +51,8 @@ if [ "$START_STEP" -le 1 ]; then
         --no_subprocess \
         --devices 1 \
         --config design trainer.accelerator=gpu \
-        --config design trainer.devices=1
+        --config design trainer.devices=1 \
+        --config design override.diffusion_process_args.enable_property_steering=False
 fi
 
 # Step 2: Generate samples with high stability steering
@@ -65,12 +66,10 @@ if [ "$START_STEP" -le 2 ]; then
         --steps design \
         --no_subprocess \
         --devices 1 \
+        --config_dir validation_steering \
         --config design trainer.accelerator=gpu \
         --config design trainer.devices=1 \
-        --config design override.diffusion_process_args.enable_property_steering=True \
-        --config design override.diffusion_process_args.target_stability=0.8 \
-        --config design override.diffusion_process_args.stability_bias_weight=1.0 \
-        --config design override.diffusion_process_args.steering_update_freq=5
+        --config design override.diffusion_process_args.target_stability=0.8
 fi
 
 # Step 3: Generate samples with low stability steering
@@ -84,12 +83,10 @@ if [ "$START_STEP" -le 3 ]; then
         --steps design \
         --no_subprocess \
         --devices 1 \
+        --config_dir validation_steering \
         --config design trainer.accelerator=gpu \
         --config design trainer.devices=1 \
-        --config design override.diffusion_process_args.enable_property_steering=True \
-        --config design override.diffusion_process_args.target_stability=-0.5 \
-        --config design override.diffusion_process_args.stability_bias_weight=1.0 \
-        --config design override.diffusion_process_args.steering_update_freq=5
+        --config design override.diffusion_process_args.target_stability=-0.5
 fi
 
 # Step 4: Extract sequences
