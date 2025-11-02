@@ -172,6 +172,20 @@ class DiffusionModule(Module):
         diffusion_conditioning,
         multiplicity=1,
     ):
+        # Initialize profiling timers
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if not hasattr(self, '_atom_encoder_time'):
+                self._atom_encoder_time = 0.0
+                self._token_transformer_time = 0.0
+                self._atom_decoder_time = 0.0
+                self._other_time = 0.0
+        
+        # Time conditioning
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            other_start = time.time()
+        
         if self.activation_checkpointing:
             s, normed_fourier = torch.utils.checkpoint.checkpoint(
                 self.single_conditioner,
@@ -185,7 +199,18 @@ class DiffusionModule(Module):
                 s_trunk.repeat_interleave(multiplicity, 0),
                 s_inputs.repeat_interleave(multiplicity, 0),
             )
+        
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._other_time += time.time() - other_start
 
+        # Profile atom attention encoder
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            encoder_start = time.time()
+        
         # Sequence-local Atom Attention and aggregation to coarse-grained tokens
         a, q_skip, c_skip, to_keys = self.atom_attention_encoder(
             feats=feats,
@@ -196,11 +221,32 @@ class DiffusionModule(Module):
             r=r_noisy,  # Float['b m 3'],
             multiplicity=multiplicity,
         )
+        
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._atom_encoder_time += time.time() - encoder_start
 
         # Full self-attention on token level
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            other_start = time.time()
+        
         a = a + self.s_to_a_linear(s)
 
         mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+        
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._other_time += time.time() - other_start
+
+        # Profile token transformer
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            transformer_start = time.time()
 
         # run token level transformations
         a = self.token_transformer(
@@ -211,6 +257,17 @@ class DiffusionModule(Module):
             multiplicity=multiplicity,
         )
         a = self.a_norm(a)
+        
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._token_transformer_time += time.time() - transformer_start
+
+        # Profile atom attention decoder
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            decoder_start = time.time()
 
         # Broadcast token activations to atoms and run Sequence-local Atom Attention
         r_update, res_type = self.atom_attention_decoder(
@@ -222,6 +279,11 @@ class DiffusionModule(Module):
             multiplicity=multiplicity,
             to_keys=to_keys,
         )
+        
+        if hasattr(self, '_enable_profiling') and self._enable_profiling:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._atom_decoder_time += time.time() - decoder_start
 
         return {
             "r_update": r_update,
@@ -502,10 +564,21 @@ class AtomDiffusion(Module):
                 self._total_postprocessing_time = 0.0
             self._total_preprocessing_time += prep_time
 
-        # Profile score_model call
+        # Profile score_model call with detailed breakdown
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         model_start = time.time()
+        
+        # Pass profiling flag to score_model if available
+        if hasattr(self.score_model, '_enable_profiling'):
+            self.score_model._enable_profiling = True
+            # Reset timers if they exist
+            if hasattr(self.score_model, '_atom_encoder_time'):
+                self.score_model._atom_encoder_time = 0.0
+                self.score_model._token_transformer_time = 0.0
+                self.score_model._atom_decoder_time = 0.0
+                self.score_model._other_time = 0.0
+        
         net_out = self.score_model(
             r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
             times=self.c_noise(sigma),
@@ -515,8 +588,21 @@ class AtomDiffusion(Module):
             torch.cuda.synchronize()
         model_time = time.time() - model_start
         
-        if hasattr(self, '_profile_forward'):
+        # Accumulate detailed timings from score_model
+        if hasattr(self, '_profile_forward') and hasattr(self.score_model, '_atom_encoder_time'):
             self._total_score_model_time += model_time
+            # Store detailed breakdown
+            if not hasattr(self, '_score_model_breakdown'):
+                self._score_model_breakdown = {
+                    'atom_encoder': 0.0,
+                    'token_transformer': 0.0,
+                    'atom_decoder': 0.0,
+                    'other': 0.0,
+                }
+            self._score_model_breakdown['atom_encoder'] += self.score_model._atom_encoder_time
+            self._score_model_breakdown['token_transformer'] += self.score_model._token_transformer_time
+            self._score_model_breakdown['atom_decoder'] += self.score_model._atom_decoder_time
+            self._score_model_breakdown['other'] += self.score_model._other_time
 
         # Profile postprocessing
         if torch.cuda.is_available():
@@ -691,6 +777,15 @@ class AtomDiffusion(Module):
         total_postprocessing_time = 0.0
         total_alignment_time = 0.0
         total_update_time = 0.0
+        # Score model breakdown tracking
+        self._score_model_breakdown = {
+            'atom_encoder': 0.0,
+            'token_transformer': 0.0,
+            'atom_decoder': 0.0,
+            'other': 0.0,
+        }
+        # Enable profiling in score_model
+        self.score_model._enable_profiling = True
         start_time = time.time()
         
         for step_idx, (
@@ -844,7 +939,20 @@ class AtomDiffusion(Module):
             print(f"    - Preprocessing: {total_preprocessing_time:.2f}s ({prep_pct:.1f}%)")
         if total_score_model_time > 0:
             model_pct = 100 * total_score_model_time / total_time if total_time > 0 else 0
-            print(f"    - Score model: {total_score_model_time:.2f}s ({model_pct:.1f}%)")
+            print(f"    - Score model (total): {total_score_model_time:.2f}s ({model_pct:.1f}%)")
+            # Detailed score model breakdown
+            if hasattr(self, '_score_model_breakdown'):
+                breakdown = self._score_model_breakdown
+                total_score_breakdown = sum(breakdown.values())
+                if total_score_breakdown > 0:
+                    atom_enc_pct = 100 * breakdown['atom_encoder'] / total_score_model_time
+                    token_tf_pct = 100 * breakdown['token_transformer'] / total_score_model_time
+                    atom_dec_pct = 100 * breakdown['atom_decoder'] / total_score_model_time
+                    other_pct = 100 * breakdown['other'] / total_score_model_time
+                    print(f"      - Atom attention encoder: {breakdown['atom_encoder']:.2f}s ({atom_enc_pct:.1f}%)")
+                    print(f"      - Token transformer: {breakdown['token_transformer']:.2f}s ({token_tf_pct:.1f}%)")
+                    print(f"      - Atom attention decoder: {breakdown['atom_decoder']:.2f}s ({atom_dec_pct:.1f}%)")
+                    print(f"      - Other (conditioning, etc.): {breakdown['other']:.2f}s ({other_pct:.1f}%)")
         if total_postprocessing_time > 0:
             post_pct = 100 * total_postprocessing_time / total_time if total_time > 0 else 0
             print(f"    - Postprocessing: {total_postprocessing_time:.2f}s ({post_pct:.1f}%)")
