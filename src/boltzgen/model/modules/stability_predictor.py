@@ -68,6 +68,9 @@ class TAPEStabilityPredictor(nn.Module):
         nn.init.xavier_uniform_(self.stability_head.weight)
         nn.init.zeros_(self.stability_head.bias)
         
+        # Initialize tokenizer once (reused for all forward passes)
+        self.tokenizer = TAPETokenizer()
+        
         # Note: In practice, you may need to load pre-trained weights for the
         # stability head if TAPE provides them separately
         
@@ -92,10 +95,8 @@ class TAPEStabilityPredictor(nn.Module):
         # Get current device from model (handles device changes)
         device = self.device
         
-        # Convert sequence to token IDs
-        # TAPE uses its own tokenizer
-        tokenizer = TAPETokenizer()
-        token_ids = tokenizer.encode(sequence)
+        # Convert sequence to token IDs using pre-initialized tokenizer
+        token_ids = self.tokenizer.encode(sequence)
         # Handle numpy array or list from tokenizer
         if isinstance(token_ids, np.ndarray):
             token_ids = torch.tensor(
