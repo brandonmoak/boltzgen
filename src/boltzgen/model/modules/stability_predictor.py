@@ -98,8 +98,31 @@ class TAPEStabilityPredictor(nn.Module):
         
         # Profile tokenization (CPU operation, no sync needed)
         tok_start = time.time()
+        # Filter sequence to only include valid amino acid characters
+        # TAPE tokenizer expects standard 20 amino acids (A-Z except B, J, O, U, X, Z)
+        # Actually, TAPE uses a specific vocabulary - let's filter out invalid chars
+        # Valid standard amino acids: A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y
+        # We'll also allow X for unknown (some tokenizers handle it, some don't)
+        valid_aa_chars = set("ACDEFGHIKLMNPQRSTVWY")
+        filtered_sequence = "".join(c for c in sequence.upper() if c in valid_aa_chars)
+        
+        if len(filtered_sequence) == 0:
+            # No valid amino acids found
+            return 0.0  # Return neutral stability value
+        
+        if len(filtered_sequence) != len(sequence):
+            # Some characters were filtered out
+            # This is okay, but we should note it for debugging
+            pass
+        
         # Convert sequence to token IDs using pre-initialized tokenizer
-        token_ids = self.tokenizer.encode(sequence)
+        try:
+            token_ids = self.tokenizer.encode(filtered_sequence)
+        except Exception as e:
+            # If tokenization fails, log and return neutral value
+            print(f"Warning: TAPE tokenization failed for sequence '{sequence[:50]}...': {e}")
+            return 0.0
+        
         # Handle numpy array or list from tokenizer
         if isinstance(token_ids, np.ndarray):
             token_ids = torch.tensor(

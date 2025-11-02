@@ -85,7 +85,10 @@ def extract_sequence_from_res_type(
                 # Unknown or non-protein token
                 aa_letter = "X"
             
-            sequence_letters.append(aa_letter)
+            # Skip gap characters ("-") as they're not valid amino acids
+            # Also skip if we got "-" from the mapping
+            if aa_letter != "-":
+                sequence_letters.append(aa_letter)
         
         sequence = "".join(sequence_letters)
         sequences.append(sequence)
