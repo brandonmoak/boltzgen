@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from math import sqrt
 from math import exp
 from scipy.stats import norm
@@ -643,6 +644,13 @@ class AtomDiffusion(Module):
         # gradually denoise
         coords_traj = [atom_coords]
         x0_coords_traj = []
+        
+        # Profiling: track timing for different phases
+        total_forward_time = 0.0
+        total_steering_time = 0.0
+        steering_call_count = 0
+        start_time = time.time()
+        
         for step_idx, (
             sigma_tm,
             sigma_t,
@@ -672,6 +680,8 @@ class AtomDiffusion(Module):
             eps = noise_scale * sqrt(noise_var) * torch.randn(shape, device=self.device)
             atom_coords_noisy = atom_coords + eps
 
+            # Profile forward pass
+            forward_start = time.time()
             with torch.no_grad():
                 atom_coords_denoised, net_out = self.preconditioned_network_forward(
                     atom_coords_noisy,
@@ -682,6 +692,7 @@ class AtomDiffusion(Module):
                         **network_condition_kwargs,
                     ),
                 )
+            total_forward_time += time.time() - forward_start
             
             # Compute property-based bias if steering is enabled
             # We use the res_type predictions from net_out
@@ -691,11 +702,17 @@ class AtomDiffusion(Module):
                 and step_idx % self.steering_update_freq == 0
                 and net_out.get("res_type") is not None
             ):
+                steering_start = time.time()
                 property_bias = self._compute_property_bias(
                     net_out,
                     network_condition_kwargs,
                     multiplicity,
                 )
+                steering_time = time.time() - steering_start
+                total_steering_time += steering_time
+                steering_call_count += 1
+                if steering_call_count <= 3 or steering_call_count % 20 == 0:
+                    print(f"  [Profiling] Steering call #{steering_call_count}: {steering_time*1000:.2f}ms")
             
             # Store property bias for merging in next iteration's forward pass
             if property_bias:
@@ -721,6 +738,22 @@ class AtomDiffusion(Module):
             coords_traj.append(atom_coords_next)
             x0_coords_traj.append(atom_coords_denoised)
 
+        # Print profiling summary
+        total_time = time.time() - start_time
+        print(f"\n[Profiling Summary] Total diffusion time: {total_time:.2f}s")
+        forward_pct = 100 * total_forward_time / total_time if total_time > 0 else 0
+        print(f"  - Forward pass time: {total_forward_time:.2f}s ({forward_pct:.1f}%)")
+        if self.enable_property_steering:
+            steering_pct = 100 * total_steering_time / total_time if total_time > 0 else 0
+            print(f"  - Steering time: {total_steering_time:.2f}s ({steering_pct:.1f}%)")
+            print(f"  - Steering calls: {steering_call_count}")
+            if steering_call_count > 0:
+                avg_steering = total_steering_time / steering_call_count * 1000
+                print(f"  - Avg steering time per call: {avg_steering:.2f}ms")
+        other_time = total_time - total_forward_time - total_steering_time
+        other_pct = 100 * other_time / total_time if total_time > 0 else 0
+        print(f"  - Other overhead: {other_time:.2f}s ({other_pct:.1f}%)\n")
+        
         return {
             "sample_atom_coords": atom_coords_next,
             "coords_traj": coords_traj,

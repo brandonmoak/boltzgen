@@ -1,5 +1,6 @@
 """TAPE stability prediction model wrapper."""
 
+import time
 from typing import Optional
 
 import numpy as np
@@ -95,6 +96,8 @@ class TAPEStabilityPredictor(nn.Module):
         # Get current device from model (handles device changes)
         device = self.device
         
+        # Profile tokenization
+        tok_start = time.time()
         # Convert sequence to token IDs using pre-initialized tokenizer
         token_ids = self.tokenizer.encode(sequence)
         # Handle numpy array or list from tokenizer
@@ -106,8 +109,10 @@ class TAPEStabilityPredictor(nn.Module):
             token_ids = torch.tensor(
                 [token_ids], device=device, dtype=torch.long
             )
+        tok_time = time.time() - tok_start
         
         # Get model output
+        model_start = time.time()
         with torch.no_grad():
             output = self.model(token_ids)
             # TAPE returns a tuple: (hidden_states, pooled_output)
@@ -132,8 +137,25 @@ class TAPEStabilityPredictor(nn.Module):
                     sequence_repr = output
             
             # Predict stability
+            head_start = time.time()
             stability = self.stability_head(sequence_repr)
             stability_score = stability.item()
+            head_time = time.time() - head_start
+        model_time = time.time() - model_start
+        
+        # Print detailed timing (only first few calls to avoid spam)
+        if not hasattr(self, '_call_count'):
+            self._call_count = 0
+        self._call_count += 1
+        if self._call_count <= 3:
+            total_time = (time.time() - tok_start) * 1000
+            print(
+                f"    [TAPE Profile] Call #{self._call_count}: "
+                f"total={total_time:.2f}ms "
+                f"(tokenize={tok_time*1000:.2f}ms, "
+                f"model={model_time*1000:.2f}ms, "
+                f"head={head_time*1000:.2f}ms)"
+            )
         
         return stability_score
     
