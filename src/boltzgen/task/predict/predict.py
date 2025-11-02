@@ -132,10 +132,29 @@ class Predict(Task):
             )
             self.trainer["num_nodes"] = int(os.environ.get("SLURM_NNODES", 1))
 
+        # Determine if strict loading should be used
+        # When property steering is enabled, new modules (stability_predictor, res_type_predictor)
+        # may not be in the checkpoint, so we use strict=False
+        enable_steering = False
+        
+        # Check override dict for property steering
+        # Config path: override.diffusion_process_args.enable_property_steering
+        if self.override:
+            # Check if diffusion_process_args is at top level (typical case)
+            if "diffusion_process_args" in self.override:
+                dp_args = self.override["diffusion_process_args"]
+                if isinstance(dp_args, dict):
+                    enable_steering = bool(dp_args.get("enable_property_steering", False))
+        
+        # Use strict=False when steering is enabled (new modules won't be in checkpoint)
+        strict_loading = not enable_steering
+        if enable_steering:
+            print("Property steering enabled - using strict=False for checkpoint loading")
+        
         # Load model
         self.model_module: LightningModule = Boltz.load_from_checkpoint(
             self.checkpoint,
-            strict=True,
+            strict=strict_loading,
             use_ema=self.use_ema,
             checkpoint_diffusion_conditioning=self.checkpoint_diffusion_conditioning,
             map_location="cpu",
