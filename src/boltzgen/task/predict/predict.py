@@ -137,63 +137,66 @@ class Predict(Task):
         # Only use strict=False if steering is actually enabled (not just if diffusion_process_args exists)
         use_strict = True
         
-        # Debug: Check what's in override and what the checkpoint has
-        if self.override and "diffusion_process_args" in self.override:
-            dp_args = self.override.get("diffusion_process_args", {})
-            print("\n" + "="*60)
-            print("DEBUG: diffusion_process_args override detected")
-            print("="*60)
-            print(f"Override diffusion_process_args keys: {list(dp_args.keys())}")
-            print(f"Override diffusion_process_args values: {dp_args}")
-            
-            # Load checkpoint to inspect hyperparameters
+        # Prepare override dict - intelligently merge diffusion_process_args with checkpoint
+        final_override = dict(self.override) if self.override else {}
+        
+        if "diffusion_process_args" in final_override:
+            # Load checkpoint to get original training parameters
             try:
-                checkpoint_data = torch.load(self.checkpoint, map_location="cpu")
+                checkpoint_data = torch.load(self.checkpoint, map_location="cpu", weights_only=False)
                 if "hyper_parameters" in checkpoint_data:
                     ckpt_hp = checkpoint_data["hyper_parameters"]
                     if "diffusion_process_args" in ckpt_hp:
-                        ckpt_dp_args = ckpt_hp["diffusion_process_args"]
-                        print(f"\nCheckpoint diffusion_process_args keys: {list(ckpt_dp_args.keys())}")
-                        print(f"Checkpoint has {len(ckpt_dp_args)} parameters")
+                        # Start with checkpoint's original parameters
+                        merged_dp_args = dict(ckpt_hp["diffusion_process_args"])
                         
-                        # Check for missing keys
-                        missing_keys = set(ckpt_dp_args.keys()) - set(dp_args.keys())
-                        if missing_keys:
-                            print(f"\n⚠️  WARNING: Override is missing {len(missing_keys)} parameters from checkpoint:")
-                            for key in sorted(missing_keys)[:10]:  # Show first 10
-                                print(f"  - {key}: {ckpt_dp_args[key]}")
-                            if len(missing_keys) > 10:
-                                print(f"  ... and {len(missing_keys) - 10} more")
+                        # Only override steering-related parameters
+                        override_dp_args = final_override["diffusion_process_args"]
+                        steering_keys = [
+                            "enable_property_steering",
+                            "target_stability",
+                            "stability_bias_weight",
+                            "stability_bias_temperature",
+                            "steering_update_freq",
+                            "use_atom_bias",
+                            "use_token_bias",
+                            "tape_checkpoint_path",
+                        ]
                         
-                        # Check for conflicting values
-                        conflicting = []
-                        for key in dp_args.keys():
-                            if key in ckpt_dp_args and ckpt_dp_args[key] != dp_args[key]:
-                                conflicting.append((key, ckpt_dp_args[key], dp_args[key]))
-                        if conflicting:
-                            print(f"\n⚠️  WARNING: Override conflicts with checkpoint for {len(conflicting)} parameters:")
-                            for key, ckpt_val, override_val in conflicting[:5]:  # Show first 5
-                                print(f"  - {key}: checkpoint={ckpt_val}, override={override_val}")
-                            if len(conflicting) > 5:
-                                print(f"  ... and {len(conflicting) - 5} more conflicts")
+                        # Merge only steering parameters
+                        for key in steering_keys:
+                            if key in override_dp_args:
+                                merged_dp_args[key] = override_dp_args[key]
+                        
+                        # Replace override with merged version
+                        final_override["diffusion_process_args"] = merged_dp_args
+                        
+                        print("\n" + "="*60)
+                        print("Merged diffusion_process_args: using checkpoint parameters + steering overrides")
+                        print("="*60)
+                        steering_overrides = {k: merged_dp_args.get(k) for k in steering_keys if k in merged_dp_args}
+                        print(f"Steering parameters: {steering_overrides}")
+                        print(f"All other parameters come from checkpoint (e.g., sampling_schedule, time_dilation, etc.)")
+                        print("="*60 + "\n")
                     else:
                         print("\n⚠️  WARNING: Checkpoint does not contain diffusion_process_args in hyper_parameters")
+                        print("Using override as-is (may cause parameter mismatches)")
                 else:
                     print("\n⚠️  WARNING: Checkpoint does not contain hyper_parameters")
+                    print("Using override as-is (may cause parameter mismatches)")
             except Exception as e:
-                print(f"\n⚠️  Could not inspect checkpoint: {e}")
+                print(f"\n⚠️  Could not load checkpoint for merging: {e}")
+                print("Using override as-is (may cause parameter mismatches)")
             
+            # Check if steering is enabled for strict loading decision
+            dp_args = final_override.get("diffusion_process_args", {})
             if dp_args.get("enable_property_steering", False):
                 use_strict = False
-                print("\nUsing strict=False for checkpoint loading (property steering enabled)")
+                print("Using strict=False for checkpoint loading (property steering enabled)")
             else:
-                print("\nUsing strict=True (steering disabled, checking for parameter mismatches)")
-            print("="*60 + "\n")
+                print("Using strict=True (steering disabled)")
         
-        # Enable debug mode if we're overriding diffusion_process_args
-        enable_debug = (self.override and "diffusion_process_args" in self.override)
-        
-        # Load model
+        # Load model with merged override
         self.model_module: LightningModule = Boltz.load_from_checkpoint(
             self.checkpoint,
             strict=use_strict,
@@ -201,18 +204,14 @@ class Predict(Task):
             checkpoint_diffusion_conditioning=self.checkpoint_diffusion_conditioning,
             map_location="cpu",
             predict_args=self.predict_args,
-            **self.override,
+            **final_override,
         )
         
-        # Enable debug on the loaded model
-        if enable_debug:
-            self.model_module._debug_init = True
-            # Re-instantiate structure_module with debug (this won't actually recreate it, but triggers debug prints)
-            # Actually, the debug prints should have already happened during __init__
-            # Let's check what was actually set
+        # Debug: Check what was actually set after loading
+        if self.override and "diffusion_process_args" in self.override:
             if hasattr(self.model_module, 'structure_module'):
                 print("\n" + "="*60)
-                print("DEBUG: After model load - checking what was actually set")
+                print("DEBUG: After model load - verifying parameters")
                 print("="*60)
                 sm = self.model_module.structure_module
                 print(f"structure_module.enable_property_steering: {sm.enable_property_steering}")
