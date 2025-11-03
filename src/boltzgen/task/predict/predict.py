@@ -134,11 +134,65 @@ class Predict(Task):
 
         # When property steering is enabled, new modules (stability_predictor, res_type_predictor)
         # won't be in the checkpoint. Use strict=False to allow missing keys.
-        # Check if diffusion_process_args is being overridden (which would include steering params)
+        # Only use strict=False if steering is actually enabled (not just if diffusion_process_args exists)
         use_strict = True
+        
+        # Debug: Check what's in override and what the checkpoint has
         if self.override and "diffusion_process_args" in self.override:
-            use_strict = False
-            print("Using strict=False for checkpoint loading (diffusion_process_args override detected)")
+            dp_args = self.override.get("diffusion_process_args", {})
+            print("\n" + "="*60)
+            print("DEBUG: diffusion_process_args override detected")
+            print("="*60)
+            print(f"Override diffusion_process_args keys: {list(dp_args.keys())}")
+            print(f"Override diffusion_process_args values: {dp_args}")
+            
+            # Load checkpoint to inspect hyperparameters
+            try:
+                import torch
+                checkpoint_data = torch.load(self.checkpoint, map_location="cpu")
+                if "hyper_parameters" in checkpoint_data:
+                    ckpt_hp = checkpoint_data["hyper_parameters"]
+                    if "diffusion_process_args" in ckpt_hp:
+                        ckpt_dp_args = ckpt_hp["diffusion_process_args"]
+                        print(f"\nCheckpoint diffusion_process_args keys: {list(ckpt_dp_args.keys())}")
+                        print(f"Checkpoint has {len(ckpt_dp_args)} parameters")
+                        
+                        # Check for missing keys
+                        missing_keys = set(ckpt_dp_args.keys()) - set(dp_args.keys())
+                        if missing_keys:
+                            print(f"\n⚠️  WARNING: Override is missing {len(missing_keys)} parameters from checkpoint:")
+                            for key in sorted(missing_keys)[:10]:  # Show first 10
+                                print(f"  - {key}: {ckpt_dp_args[key]}")
+                            if len(missing_keys) > 10:
+                                print(f"  ... and {len(missing_keys) - 10} more")
+                        
+                        # Check for conflicting values
+                        conflicting = []
+                        for key in dp_args.keys():
+                            if key in ckpt_dp_args and ckpt_dp_args[key] != dp_args[key]:
+                                conflicting.append((key, ckpt_dp_args[key], dp_args[key]))
+                        if conflicting:
+                            print(f"\n⚠️  WARNING: Override conflicts with checkpoint for {len(conflicting)} parameters:")
+                            for key, ckpt_val, override_val in conflicting[:5]:  # Show first 5
+                                print(f"  - {key}: checkpoint={ckpt_val}, override={override_val}")
+                            if len(conflicting) > 5:
+                                print(f"  ... and {len(conflicting) - 5} more conflicts")
+                    else:
+                        print("\n⚠️  WARNING: Checkpoint does not contain diffusion_process_args in hyper_parameters")
+                else:
+                    print("\n⚠️  WARNING: Checkpoint does not contain hyper_parameters")
+            except Exception as e:
+                print(f"\n⚠️  Could not inspect checkpoint: {e}")
+            
+            if dp_args.get("enable_property_steering", False):
+                use_strict = False
+                print("\nUsing strict=False for checkpoint loading (property steering enabled)")
+            else:
+                print("\nUsing strict=True (steering disabled, checking for parameter mismatches)")
+            print("="*60 + "\n")
+        
+        # Enable debug mode if we're overriding diffusion_process_args
+        enable_debug = (self.override and "diffusion_process_args" in self.override)
         
         # Load model
         self.model_module: LightningModule = Boltz.load_from_checkpoint(
@@ -150,6 +204,25 @@ class Predict(Task):
             predict_args=self.predict_args,
             **self.override,
         )
+        
+        # Enable debug on the loaded model
+        if enable_debug:
+            self.model_module._debug_init = True
+            # Re-instantiate structure_module with debug (this won't actually recreate it, but triggers debug prints)
+            # Actually, the debug prints should have already happened during __init__
+            # Let's check what was actually set
+            if hasattr(self.model_module, 'structure_module'):
+                print("\n" + "="*60)
+                print("DEBUG: After model load - checking what was actually set")
+                print("="*60)
+                sm = self.model_module.structure_module
+                print(f"structure_module.enable_property_steering: {sm.enable_property_steering}")
+                print(f"structure_module.sigma_min: {sm.sigma_min}, sigma_max: {sm.sigma_max}")
+                print(f"structure_module.sampling_schedule: {sm.sampling_schedule}")
+                print(f"structure_module.time_dilation: {sm.time_dilation}")
+                print(f"structure_module.num_sampling_steps: {sm.num_sampling_steps}")
+                print("="*60 + "\n")
+        
         self.model_module.eval()
 
         if self.compile_pairformer:

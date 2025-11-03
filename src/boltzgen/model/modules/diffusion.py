@@ -445,6 +445,19 @@ class AtomDiffusion(Module):
         self.use_atom_bias = use_atom_bias
         self.use_token_bias = use_token_bias
         
+        # Debug: Print initialization parameters
+        if hasattr(self, '_debug_init'):
+            print("\n" + "="*60)
+            print("DEBUG: AtomDiffusion.__init__ parameters")
+            print("="*60)
+            print(f"enable_property_steering: {self.enable_property_steering}")
+            print(f"sigma_min: {self.sigma_min}, sigma_max: {self.sigma_max}")
+            print(f"sampling_schedule: {self.sampling_schedule}")
+            print(f"time_dilation: {self.time_dilation}")
+            print(f"num_sampling_steps: {self.num_sampling_steps}")
+            print(f"predict_res_type in score_model: {self.score_model.atom_attention_decoder.predict_res_type}")
+            print("="*60 + "\n")
+        
         if self.enable_property_steering:
             if self.target_stability is None:
                 raise ValueError(

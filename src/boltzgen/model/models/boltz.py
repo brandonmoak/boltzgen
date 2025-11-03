@@ -129,6 +129,10 @@ class Boltz(LightningModule):
         4. Affinity prediction
         """
         self.save_hyperparameters()
+        
+        # Enable debug mode if this is being instantiated from a checkpoint load with override
+        # (We'll set this in predict.py before loading)
+        self._debug_init = False
         self.inverse_fold = inverse_fold
         self.inference_logging = inference_logging
 
@@ -307,6 +311,20 @@ class Boltz(LightningModule):
             )
 
             # Output modules
+            # Debug: Print what diffusion_process_args contains
+            if hasattr(self, '_debug_init'):
+                print("\n" + "="*60)
+                print("DEBUG: Boltz.__init__ diffusion_process_args")
+                print("="*60)
+                print(f"diffusion_process_args keys: {list(diffusion_process_args.keys())}")
+                print(f"diffusion_process_args has {len(diffusion_process_args)} parameters")
+                # Show critical parameters
+                for key in ["sigma_min", "sigma_max", "sampling_schedule", "time_dilation", 
+                           "enable_property_steering", "target_stability", "num_sampling_steps"]:
+                    if key in diffusion_process_args:
+                        print(f"  {key}: {diffusion_process_args[key]}")
+                print("="*60 + "\n")
+            
             self.structure_module = AtomDiffusion(
                 score_model_args={
                     "token_s": token_s,
@@ -318,6 +336,8 @@ class Boltz(LightningModule):
                 },
                 **diffusion_process_args,
             )
+            # Enable debug flag for AtomDiffusion
+            self.structure_module._debug_init = True
             self.distogram_module = DistogramModule(token_z, num_bins)
             self.predict_bfactor = predict_bfactor
             if predict_bfactor:
