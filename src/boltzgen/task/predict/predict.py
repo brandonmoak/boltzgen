@@ -148,7 +148,6 @@ class Predict(Task):
             
             # Load checkpoint to inspect hyperparameters
             try:
-                import torch
                 checkpoint_data = torch.load(self.checkpoint, map_location="cpu")
                 if "hyper_parameters" in checkpoint_data:
                     ckpt_hp = checkpoint_data["hyper_parameters"]
