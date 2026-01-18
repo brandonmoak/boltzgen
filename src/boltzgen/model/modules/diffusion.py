@@ -506,6 +506,7 @@ class AtomDiffusion(Module):
         step_scale=None,
         noise_scale=None,
         inference_logging=False,
+        guidance=None,  # Optional[DiffusionGuidance] - for steering with external predictors
         **network_condition_kwargs,
     ):
         if self.training and self.step_scale_random is not None:
@@ -555,6 +556,10 @@ class AtomDiffusion(Module):
         atom_coords = init_sigma * torch.randn(shape, device=self.device)
         feats = network_condition_kwargs["feats"]
 
+        # Initialize guidance tracking
+        if guidance is not None:
+            self._guidance_info = []
+
         # gradually denoise
         coords_traj = [atom_coords]
         x0_coords_traj = []
@@ -598,6 +603,30 @@ class AtomDiffusion(Module):
                     ),
                 )
 
+            # Apply guidance if provided and res_type predictions are available
+            guidance_applied = False
+            if guidance is not None and guidance.enabled:
+                res_type_logits = net_out.get("res_type")
+                if res_type_logits is not None:
+                    # Compute sequence guidance gradient
+                    seq_guidance_grad = guidance.compute_sequence_guidance(
+                        res_type_logits=res_type_logits,
+                        feats=feats,
+                        step=step_idx,
+                        total_steps=num_sampling_steps,
+                    )
+                    if seq_guidance_grad is not None:
+                        # Store guidance info for logging/debugging
+                        if not hasattr(self, '_guidance_info'):
+                            self._guidance_info = []
+                        self._guidance_info.append({
+                            'step': step_idx,
+                            'sigma': t_hat,
+                            'grad_norm': seq_guidance_grad.norm().item(),
+                            'score': guidance.get_predictor_scores(res_type_logits).mean().item(),
+                        })
+                        guidance_applied = True
+
             if self.alignment_reverse_diff:
                 with torch.autocast("cuda", enabled=False):
                     atom_coords_noisy = weighted_rigid_align(
@@ -625,6 +654,10 @@ class AtomDiffusion(Module):
             coords_traj=coords_traj,
             x0_coords_traj=x0_coords_traj,
         )
+
+        # Include guidance info if guidance was used
+        if guidance is not None and hasattr(self, '_guidance_info'):
+            result['guidance_info'] = self._guidance_info
 
         return result
 

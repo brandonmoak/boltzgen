@@ -514,6 +514,7 @@ class Boltz(LightningModule):
         return_z_feats: bool = False,
         step_scale: Optional[float] = None,
         noise_scale: Optional[float] = None,
+        guidance=None,  # Optional[DiffusionGuidance] for steering with external predictors
     ) -> Dict[str, Tensor]:
         dict_out = {}
         if self.inference_logging:
@@ -668,6 +669,7 @@ class Boltz(LightningModule):
                             step_scale=step_scale,
                             noise_scale=noise_scale,
                             inference_logging=self.inference_logging,
+                            guidance=guidance,
                         )
                     else:
                         struct_out = self.structure_module.sample(
