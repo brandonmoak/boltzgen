@@ -727,11 +727,12 @@ class AtomAttentionDecoder(Module):
             idx = idx.repeat_interleave(multiplicity, 0)
             src = q * mask[:, :, None]
             idx_expanded = idx.unsqueeze(-1).expand(-1, -1, q.size(-1))
+            # Use functional scatter_add (not in-place) to preserve gradients from src
             s_feat = torch.zeros(
                 (q.shape[0], feats["res_type"].shape[1], q.shape[-1]),
                 device=idx_expanded.device,
-            )
-            s_feat.scatter_add_(dim=1, index=idx_expanded, src=src)
+                dtype=src.dtype,
+            ).scatter_add(dim=1, index=idx_expanded, src=src)
 
         if self.predict_res_type and s_feat is not None:
             res_type = self.res_type_predictor(s_feat)
