@@ -150,6 +150,59 @@ def plot_comparison(results_unguided: List[Dict], results_guided: List[Dict],
     return fig
 
 
+def plot_hydrophobicity_comparison(results_unguided: List[Dict], results_guided: List[Dict]):
+    """Plot both geometric and string-based hydrophobicity side by side."""
+    import matplotlib.pyplot as plt
+    
+    # Check if we have both metrics
+    has_string = any('hydrophobicity_string' in r for r in results_unguided + results_guided)
+    
+    if has_string:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # Geometric score
+        u_geo = [r.get('hydrophobicity') for r in results_unguided if r.get('hydrophobicity') is not None]
+        g_geo = [r.get('hydrophobicity') for r in results_guided if r.get('hydrophobicity') is not None]
+        n = min(len(u_geo), len(g_geo))
+        
+        for i in range(n):
+            ax1.plot([0, 1], [u_geo[i], g_geo[i]], 'o-', alpha=0.5, color='gray')
+        ax1.scatter([0], [np.mean(u_geo[:n])], s=200, c='blue', zorder=5, 
+                   label=f'Unguided: {np.mean(u_geo[:n]):.3f}')
+        ax1.scatter([1], [np.mean(g_geo[:n])], s=200, c='red', zorder=5, 
+                   label=f'Guided: {np.mean(g_geo[:n]):.3f}')
+        ax1.set_xticks([0, 1])
+        ax1.set_xticklabels(['Unguided', 'Guided'])
+        ax1.set_ylabel('Hydrophobicity (Geometric Score)')
+        ax1.set_title('Geometric Score (What Guidance Optimizes)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # String-based
+        u_str = [r.get('hydrophobicity_string') for r in results_unguided if r.get('hydrophobicity_string') is not None]
+        g_str = [r.get('hydrophobicity_string') for r in results_guided if r.get('hydrophobicity_string') is not None]
+        n = min(len(u_str), len(g_str))
+        
+        for i in range(n):
+            ax2.plot([0, 1], [u_str[i], g_str[i]], 'o-', alpha=0.5, color='gray')
+        ax2.scatter([0], [np.mean(u_str[:n])], s=200, c='blue', zorder=5, 
+                   label=f'Unguided: {np.mean(u_str[:n]):.3f}')
+        ax2.scatter([1], [np.mean(g_str[:n])], s=200, c='red', zorder=5, 
+                   label=f'Guided: {np.mean(g_str[:n]):.3f}')
+        ax2.set_xticks([0, 1])
+        ax2.set_xticklabels(['Unguided', 'Guided'])
+        ax2.set_ylabel('Hydrophobicity (String-based)')
+        ax2.set_title('String-based (From Decoded Sequence)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return fig
+    else:
+        # Fall back to single plot
+        return plot_comparison(results_unguided, results_guided, 'hydrophobicity')
+
+
 def create_sequence_comparison_html(results_unguided: List[Dict], results_guided: List[Dict],
                                      max_display: int = 10) -> str:
     """Create HTML table comparing sequences."""
@@ -185,12 +238,25 @@ def print_summary(results_unguided: List[Dict], results_guided: List[Dict]):
     print("SUMMARY")
     print("=" * 60)
     
-    for m in ['hydrophobicity', 'radius_of_gyration', 'contact_density']:
+    # Check if we have both geometric and string-based hydrophobicity
+    has_string_hydro = any('hydrophobicity_string' in r for r in results_unguided + results_guided)
+    
+    metrics = ['hydrophobicity', 'radius_of_gyration', 'contact_density']
+    if has_string_hydro:
+        metrics.append('hydrophobicity_string')
+    
+    for m in metrics:
         u_vals = [r.get(m) for r in results_unguided if r.get(m) is not None]
         g_vals = [r.get(m) for r in results_guided if r.get(m) is not None]
         
         if u_vals and g_vals:
-            print(f"\n{m.replace('_', ' ').title()}:")
+            label = m.replace('_', ' ').title()
+            if m == 'hydrophobicity':
+                label = 'Hydrophobicity (Geometric Score)'
+            elif m == 'hydrophobicity_string':
+                label = 'Hydrophobicity (String-based)'
+            
+            print(f"\n{label}:")
             print(f"  Unguided: {np.mean(u_vals):.3f} ± {np.std(u_vals):.3f}")
             print(f"  Guided:   {np.mean(g_vals):.3f} ± {np.std(g_vals):.3f}")
             print(f"  Δ:        {np.mean(g_vals) - np.mean(u_vals):+.3f}")

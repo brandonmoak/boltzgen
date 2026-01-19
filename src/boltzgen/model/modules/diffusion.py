@@ -594,11 +594,21 @@ class AtomDiffusion(Module):
             atom_coords_noisy = atom_coords + eps
 
             # Check if guidance should be applied this step
+            progress = step_idx / max(num_sampling_steps - 1, 1)
+            schedule_weight = guidance.get_schedule_weight(progress) if guidance is not None else 0.0
             use_guidance = (
                 guidance is not None 
                 and guidance.enabled 
-                and guidance.get_schedule_weight(step_idx / max(num_sampling_steps - 1, 1)) > 0
+                and schedule_weight > 0
             )
+            
+            # Debug print (first step and every 10 steps)
+            if step_idx == 0 or step_idx % 10 == 0:
+                print(f"[DEBUG] Step {step_idx}/{num_sampling_steps-1}: "
+                      f"guidance={guidance is not None}, "
+                      f"enabled={guidance.enabled if guidance is not None else False}, "
+                      f"schedule_weight={schedule_weight:.3f}, "
+                      f"use_guidance={use_guidance}")
             
             coord_guidance_grad = None
             
