@@ -34,12 +34,16 @@ from boltzgen.model.modules.guidance import (
 
 # Config
 YAML_PATH = Path(__file__).parent.parent / "example/vanilla_protein/1g13prot.yaml"
-NUM_SAMPLES = 50  # Full statistical test
+NUM_SAMPLES = 20  # Full statistical test
 BATCH_SIZE = 10  # Number of samples to generate in parallel
 SAMPLING_STEPS = 50
 GUIDANCE_SCALE = 50.0  # Increased for stronger effect
 
+# Masking toggle: Set to True to apply feature masking (matches notebook behavior)
+USE_MASKING = True  # Set to True to enable masking
+
 print("\n=== STARTUP PROFILING ===")
+print(f"Masking: {'ENABLED' if USE_MASKING else 'DISABLED'}")
 startup_start = time.perf_counter()
 
 # Get checkpoint (cached after first download)
@@ -62,6 +66,10 @@ model = Boltz.load_from_checkpoint(
     weights_only=False,
 )
 model.eval()
+
+# Override masker mask setting if USE_MASKING is set
+model.masker.mask = USE_MASKING
+
 torch.cuda.synchronize()
 print(f"  Load checkpoint to GPU: {time.perf_counter() - t0:.2f}s")
 
@@ -199,9 +207,12 @@ for batch_idx in range(num_batches):
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     
+    # Apply masking if enabled
+    feats_to_use = model.masker(feats_batched) if USE_MASKING else feats_batched
+    
     with torch.no_grad():
         out = model.forward(
-            feats=feats_batched,
+            feats=feats_to_use,
             recycling_steps=1,
             num_sampling_steps=SAMPLING_STEPS,
             diffusion_samples=current_batch_size,
@@ -260,8 +271,11 @@ for batch_idx in range(num_batches):
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     
+    # Apply masking if enabled
+    feats_to_use = model.masker(feats_batched) if USE_MASKING else feats_batched
+    
     out = model.forward(
-        feats=feats_batched,
+        feats=feats_to_use,
         recycling_steps=1,
         num_sampling_steps=SAMPLING_STEPS,
         diffusion_samples=current_batch_size,
