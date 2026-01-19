@@ -1,4 +1,8 @@
-"""Guidance module for steering diffusion generation with external predictors."""
+"""Guidance module for steering diffusion generation with property optimization.
+
+BoltzGen encodes residue identity geometrically using virtual atoms. This module
+provides differentiable guidance that works directly with this representation.
+"""
 
 from boltzgen.model.modules.guidance.sequence_utils import (
     logits_to_aa_string,
@@ -24,8 +28,11 @@ from boltzgen.model.modules.guidance.mock_predictor import (
 )
 
 from boltzgen.model.modules.guidance.guidance import (
-    DiffusionGuidance,
-    create_guidance,
+    GeometricGuidance,
+    create_geometric_guidance,
+    enable_profiling,
+    reset_profiling,
+    get_profiling_stats,
 )
 
 __all__ = [
@@ -41,12 +48,16 @@ __all__ = [
     # Predictor interface
     "SequencePredictor",
     "EnsemblePredictor",
-    # Mock predictors
+    # Mock predictors (for testing)
     "HydrophobicityPredictor",
     "SequenceLengthPredictor",
     "ConstantPredictor",
     "AminoAcidFrequencyPredictor",
-    # Guidance
-    "DiffusionGuidance",
-    "create_guidance",
+    # Geometric guidance
+    "GeometricGuidance",
+    "create_geometric_guidance",
+    # Profiling
+    "enable_profiling",
+    "reset_profiling", 
+    "get_profiling_stats",
 ]

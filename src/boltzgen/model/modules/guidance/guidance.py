@@ -1,78 +1,120 @@
-"""Guidance module for steering diffusion with external predictors.
+"""Geometric guidance for steering diffusion with property optimization.
 
-This module provides the core guidance computation that integrates
-sequence predictors with the diffusion sampling process.
+BoltzGen encodes residue identity geometrically using virtual atoms - 14 atoms
+per residue where sidechain atoms "collapse" to backbone positions in patterns
+that uniquely identify each amino acid. This module provides differentiable
+property optimization that works directly with this representation.
 """
 
-from typing import Dict, Optional, Callable, Literal
+from typing import Dict, Optional, Literal
 import math
+import time
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from boltzgen.data import const
-from boltzgen.model.modules.guidance.predictor import SequencePredictor
-from boltzgen.model.modules.guidance.sequence_utils import (
-    straight_through_softmax,
-    extract_canonical_logits,
-    aa_indices_to_string,
-    NUM_CANONICAL_AAS,
-)
 
 
-class DiffusionGuidance(nn.Module):
-    """Computes guidance gradients for steering diffusion sampling.
+# Profiling storage (module-level for easy access)
+_profiling_enabled = False
+_profiling_stats = {
+    "compute_score_calls": 0,
+    "compute_score_total_ms": 0.0,
+    "residues_processed": 0,
+    "cdist_ms": 0.0,
+    "ste_ms": 0.0,
+    "pattern_match_ms": 0.0,
+}
+
+
+def enable_profiling(enabled: bool = True):
+    """Enable or disable profiling."""
+    global _profiling_enabled
+    _profiling_enabled = enabled
+    if enabled:
+        reset_profiling()
+
+
+def reset_profiling():
+    """Reset profiling statistics."""
+    global _profiling_stats
+    _profiling_stats = {
+        "compute_score_calls": 0,
+        "compute_score_total_ms": 0.0,
+        "residues_processed": 0,
+        "cdist_ms": 0.0,
+        "ste_ms": 0.0,
+        "pattern_match_ms": 0.0,
+    }
+
+
+def get_profiling_stats() -> dict:
+    """Get profiling statistics."""
+    stats = _profiling_stats.copy()
+    if stats["compute_score_calls"] > 0:
+        stats["avg_ms_per_call"] = stats["compute_score_total_ms"] / stats["compute_score_calls"]
+    if stats["residues_processed"] > 0:
+        stats["avg_ms_per_residue"] = stats["compute_score_total_ms"] / stats["residues_processed"]
+    return stats
+
+
+class GeometricGuidance(nn.Module):
+    """Guidance that decodes residue type from atom geometry.
     
-    This module:
-    1. Takes res_type logits from the diffusion model
-    2. Applies STE to get discrete tokens with gradient path
-    3. Scores sequences using a predictor
-    4. Computes gradients to guide the diffusion process
+    BoltzGen encodes residue identity using virtual atoms - 14 atoms per residue
+    where sidechain atoms "collapse" to backbone positions in a pattern that
+    uniquely identifies each amino acid type.
+    
+    This guidance module:
+    1. Decodes soft residue probabilities from atom coordinates
+    2. Computes a differentiable property score (e.g., hydrophobicity)
+    3. Backpropagates to get gradients for steering diffusion
     
     Example usage:
-        predictor = HydrophobicityPredictor()
-        guidance = DiffusionGuidance(predictor, guidance_scale=1.0)
-        
-        # In diffusion sampling loop:
-        guidance_grad = guidance.compute_guidance(
-            atom_coords=atom_coords_noisy,
-            res_type_logits=net_out["res_type"],
-            sigma=t_hat,
-            feats=feats,
+        guidance = GeometricGuidance(
+            property_type="hydrophobicity",
+            higher_is_better=True,
+            guidance_scale=5.0,
         )
-        atom_coords_next = atom_coords_next + guidance_grad
+        
+        # Pass to model.forward()
+        out = model.forward(feats=feats, guidance=guidance, ...)
     """
     
     def __init__(
         self,
-        predictor: SequencePredictor,
+        property_type: str = "hydrophobicity",
+        higher_is_better: bool = True,
         guidance_scale: float = 1.0,
-        temperature: float = 1.0,
+        temperature: float = 0.1,
         schedule: Literal["constant", "linear", "cosine", "sigmoid"] = "constant",
-        schedule_start: float = 0.0,  # When to start applying guidance (0-1)
-        schedule_end: float = 1.0,    # When guidance reaches full strength
-        clamp_grad: Optional[float] = None,  # Max gradient norm
+        schedule_start: float = 0.0,
+        schedule_end: float = 1.0,
+        clamp_grad: Optional[float] = None,
         enabled: bool = True,
     ):
-        """Initialize guidance module.
+        """Initialize geometric guidance.
         
         Args:
-            predictor: Sequence property predictor
-            guidance_scale: Base scale for guidance gradient
-            temperature: Temperature for STE softmax (lower = sharper)
-            schedule: How guidance scale varies over diffusion steps
-                - "constant": Always use guidance_scale
+            property_type: Property to optimize ("hydrophobicity")
+            higher_is_better: Whether to maximize (True) or minimize (False)
+            guidance_scale: Scale for guidance gradient
+            temperature: Temperature for soft decoding (lower = sharper)
+            schedule: Guidance schedule over diffusion steps
+                - "constant": Always use full guidance_scale
                 - "linear": Ramp from 0 to guidance_scale
                 - "cosine": Cosine ramp from 0 to guidance_scale  
                 - "sigmoid": Sigmoid ramp from 0 to guidance_scale
-            schedule_start: Diffusion progress (0-1) when guidance starts
-            schedule_end: Diffusion progress (0-1) when guidance reaches full strength
-            clamp_grad: If set, clamp gradient norm to this value
-            enabled: Whether guidance is active (for A/B testing)
+            schedule_start: When to start guidance (0-1 progress)
+            schedule_end: When guidance reaches full strength
+            clamp_grad: Max gradient norm
+            enabled: Whether guidance is active
         """
         super().__init__()
-        self.predictor = predictor
+        self.property_type = property_type
+        self.higher_is_better = higher_is_better
         self.guidance_scale = guidance_scale
         self.temperature = temperature
         self.schedule = schedule
@@ -80,6 +122,52 @@ class DiffusionGuidance(nn.Module):
         self.schedule_end = schedule_end
         self.clamp_grad = clamp_grad
         self.enabled = enabled
+        
+        self._build_patterns()
+    
+    def _build_patterns(self):
+        """Build the geometric decoding patterns from BoltzGen constants."""
+        token_to_count = const.token_to_placement_count
+        
+        # Canonical AAs in standard order (matches Kyte-Doolittle order)
+        self.canonical_aas = ['ALA', 'CYS', 'ASP', 'GLU', 'PHE', 'GLY', 'HIS', 'ILE', 
+                              'LYS', 'LEU', 'MET', 'ASN', 'PRO', 'GLN', 'ARG', 'SER',
+                              'THR', 'TRP', 'TYR', 'VAL']
+        
+        patterns = []
+        for aa in self.canonical_aas:
+            if aa in token_to_count:
+                patterns.append(token_to_count[aa])
+            else:
+                patterns.append([0, 0, 0, 0])
+        
+        self.register_buffer("count_patterns", torch.tensor(patterns, dtype=torch.float32))
+        
+        # Kyte-Doolittle hydrophobicity scale
+        # Positive = hydrophobic, Negative = hydrophilic
+        hydro = torch.tensor([
+            1.8,   # ALA - hydrophobic
+            2.5,   # CYS - hydrophobic
+            -3.5,  # ASP - hydrophilic
+            -3.5,  # GLU - hydrophilic
+            2.8,   # PHE - hydrophobic
+            -0.4,  # GLY - neutral
+            -3.2,  # HIS - hydrophilic
+            4.5,   # ILE - hydrophobic
+            -3.9,  # LYS - hydrophilic
+            3.8,   # LEU - hydrophobic
+            1.9,   # MET - hydrophobic
+            -3.5,  # ASN - hydrophilic
+            -1.6,  # PRO - slightly hydrophilic
+            -3.5,  # GLN - hydrophilic
+            -4.5,  # ARG - hydrophilic
+            -0.8,  # SER - slightly hydrophilic
+            -0.7,  # THR - slightly hydrophilic
+            -0.9,  # TRP - slightly hydrophilic
+            -1.3,  # TYR - slightly hydrophilic
+            4.2,   # VAL - hydrophobic
+        ], dtype=torch.float32)
+        self.register_buffer("hydrophobicity", hydro)
     
     def get_schedule_weight(self, progress: float) -> float:
         """Get guidance weight based on diffusion progress.
@@ -105,267 +193,207 @@ class DiffusionGuidance(nn.Module):
         elif self.schedule == "cosine":
             return 0.5 * (1 - math.cos(math.pi * t))
         elif self.schedule == "sigmoid":
-            # Sigmoid centered at t=0.5, scaled to [0, 1]
             return 1 / (1 + math.exp(-10 * (t - 0.5)))
         else:
             raise ValueError(f"Unknown schedule: {self.schedule}")
     
-    def compute_guidance(
+    def compute_geometric_score(
         self,
-        atom_coords: Tensor,
-        res_type_logits: Tensor,
-        sigma: float,
+        coords: Tensor,
         feats: Dict[str, Tensor],
-        step: int = 0,
-        total_steps: int = 1,
-    ) -> Optional[Tensor]:
-        """Compute guidance gradient for current diffusion step.
-        
-        Args:
-            atom_coords: Current atom coordinates [B, N_atoms, 3]
-            res_type_logits: Predicted residue type logits [B, N_tokens, num_tokens]
-            sigma: Current noise level
-            feats: Feature dictionary (contains masks, etc.)
-            step: Current diffusion step
-            total_steps: Total number of diffusion steps
-            
-        Returns:
-            Guidance gradient [B, N_atoms, 3] or None if guidance disabled
-        """
-        if not self.enabled:
-            return None
-        
-        if res_type_logits is None:
-            return None
-        
-        # Compute schedule weight
-        progress = step / max(total_steps - 1, 1)
-        schedule_weight = self.get_schedule_weight(progress)
-        
-        if schedule_weight == 0.0:
-            return None
-        
-        # Get design mask if available
-        design_mask = feats.get("design_mask", None)
-        if design_mask is not None:
-            design_mask = design_mask.bool()
-        
-        # Enable gradients for this computation
-        atom_coords_input = atom_coords.detach().clone()
-        atom_coords_input.requires_grad_(True)
-        
-        # We need to connect atom_coords to res_type_logits
-        # This is tricky because they're computed separately by the model
-        # For now, we compute guidance on the sequence and assume the gradient
-        # flows back through the relationship between structure and sequence
-        
-        # Apply STE to get discrete tokens with gradient path
-        # Extract canonical AA logits
-        canonical_logits = extract_canonical_logits(res_type_logits)  # [B, L, 20]
-        
-        # STE: discrete in forward, soft in backward
-        soft = F.softmax(canonical_logits / self.temperature, dim=-1)
-        hard_indices = canonical_logits.argmax(dim=-1)
-        hard = F.one_hot(hard_indices, num_classes=NUM_CANONICAL_AAS).float()
-        tokens_ste = hard - soft.detach() + soft  # [B, L, 20]
-        
-        # Expand back to full token space for predictor
-        full_tokens = torch.zeros(
-            *res_type_logits.shape[:-1], const.num_tokens,
-            device=res_type_logits.device,
-            dtype=res_type_logits.dtype,
-        )
-        start = const.canonicals_offset
-        end = start + NUM_CANONICAL_AAS
-        full_tokens[..., start:end] = tokens_ste
-        
-        # Get predictor score
-        scores = self.predictor(full_tokens, mask=design_mask)
-        
-        # Direction: maximize if higher_is_better, minimize otherwise
-        direction = self.predictor.get_guidance_direction()
-        
-        # Compute loss (we want to maximize score * direction)
-        loss = -direction * scores.sum()
-        
-        # Backprop to get gradient w.r.t. logits
-        loss.backward()
-        
-        # The gradient is w.r.t. res_type_logits, but we need it w.r.t. atom_coords
-        # This is the fundamental challenge: the predictor operates on sequences,
-        # but we want to guide the structure.
-        #
-        # For now, we'll return None and note this limitation.
-        # A proper implementation would need to either:
-        # 1. Have a differentiable path from atom_coords to res_type_logits
-        # 2. Use a structure-aware predictor
-        # 3. Use REINFORCE-style gradient estimation
-        #
-        # The gradient w.r.t. logits IS available though:
-        if res_type_logits.grad is not None:
-            logits_grad = res_type_logits.grad
-            # Scale and clamp
-            effective_scale = self.guidance_scale * schedule_weight
-            scaled_grad = effective_scale * logits_grad
-            
-            if self.clamp_grad is not None:
-                grad_norm = scaled_grad.norm()
-                if grad_norm > self.clamp_grad:
-                    scaled_grad = scaled_grad * (self.clamp_grad / grad_norm)
-            
-            # Store for potential use
-            self._last_logits_grad = scaled_grad
-        
-        # For structure guidance, we need a different approach
-        # Return None for now - the integration point will handle this
-        return None
-    
-    def compute_sequence_guidance(
-        self,
-        res_type_logits: Tensor,
-        feats: Dict[str, Tensor],
-        step: int = 0,
-        total_steps: int = 1,
-    ) -> Optional[Tensor]:
-        """Compute guidance gradient for sequence (res_type) logits.
-        
-        This is useful when the model jointly predicts structure and sequence,
-        and we want to guide the sequence prediction directly.
-        
-        Args:
-            res_type_logits: Predicted residue type logits [B, N_tokens, num_tokens]
-            feats: Feature dictionary
-            step: Current diffusion step
-            total_steps: Total number of diffusion steps
-            
-        Returns:
-            Gradient w.r.t. res_type_logits [B, N_tokens, num_tokens] or None
-        """
-        if not self.enabled:
-            return None
-        
-        if res_type_logits is None:
-            return None
-        
-        # Compute schedule weight
-        progress = step / max(total_steps - 1, 1)
-        schedule_weight = self.get_schedule_weight(progress)
-        
-        if schedule_weight == 0.0:
-            return None
-        
-        # Get design mask if available
-        design_mask = feats.get("design_mask", None)
-        if design_mask is not None:
-            design_mask = design_mask.bool()
-        
-        # Make logits require grad
-        logits = res_type_logits.detach().clone()
-        logits.requires_grad_(True)
-        
-        # Apply STE
-        canonical_logits = extract_canonical_logits(logits)
-        soft = F.softmax(canonical_logits / self.temperature, dim=-1)
-        hard_indices = canonical_logits.argmax(dim=-1)
-        hard = F.one_hot(hard_indices, num_classes=NUM_CANONICAL_AAS).float()
-        tokens_ste = hard - soft.detach() + soft
-        
-        # Expand to full token space
-        full_tokens = torch.zeros(
-            *logits.shape[:-1], const.num_tokens,
-            device=logits.device,
-            dtype=logits.dtype,
-        )
-        start = const.canonicals_offset
-        end = start + NUM_CANONICAL_AAS
-        full_tokens[..., start:end] = tokens_ste
-        
-        # Get predictor score
-        scores = self.predictor(full_tokens, mask=design_mask)
-        
-        # Direction: +1 if higher_is_better, -1 otherwise
-        direction = self.predictor.get_guidance_direction()
-        
-        # We want to move in the direction of increasing (direction * scores)
-        # So we compute gradient of scores and scale by direction
-        objective = scores.sum()
-        objective.backward()
-        
-        if logits.grad is None:
-            return None
-        
-        # Scale gradient
-        # logits.grad = ∂scores/∂logits, points toward increasing scores
-        # We want to move toward increasing (direction * scores)
-        effective_scale = self.guidance_scale * schedule_weight * direction
-        guidance_grad = effective_scale * logits.grad
-        
-        # Clamp if needed
-        if self.clamp_grad is not None:
-            grad_norm = guidance_grad.norm()
-            if grad_norm > self.clamp_grad:
-                guidance_grad = guidance_grad * (self.clamp_grad / grad_norm)
-        
-        return guidance_grad
-    
-    def get_predicted_sequences(
-        self,
-        res_type_logits: Tensor,
-        mask: Optional[Tensor] = None,
-    ) -> list:
-        """Get predicted sequences from logits (for logging/debugging).
-        
-        Args:
-            res_type_logits: Logits [B, L, num_tokens]
-            mask: Optional mask [B, L]
-            
-        Returns:
-            List of predicted amino acid sequences
-        """
-        indices = res_type_logits[..., const.canonicals_offset:const.canonicals_offset + NUM_CANONICAL_AAS].argmax(dim=-1)
-        indices = indices + const.canonicals_offset
-        return aa_indices_to_string(indices, mask)
-    
-    def get_predictor_scores(
-        self,
-        res_type_logits: Tensor,
-        mask: Optional[Tensor] = None,
+        threshold: float = 0.5,
     ) -> Tensor:
-        """Get predictor scores for current sequences (for logging/debugging).
+        """Compute property score from coordinates using geometric decoding.
+        
+        VECTORIZED VERSION: Processes all residues in parallel for efficiency.
+        
+        This implements a differentiable version of res_from_atom14 that produces
+        IDENTICAL hard outputs but allows gradients to flow via straight-through
+        estimators (STE).
         
         Args:
-            res_type_logits: Logits [B, L, num_tokens]
-            mask: Optional mask [B, L]
+            coords: Atom coordinates [B, N_atoms, 3]
+            feats: Feature dictionary with atom_to_token, design_mask
+            threshold: Distance threshold for counting (default 0.5, same as res_from_atom14)
             
         Returns:
-            Scores [B]
+            Score [B] (differentiable w.r.t. coords via STE)
         """
-        with torch.no_grad():
-            canonical_logits = extract_canonical_logits(res_type_logits)
-            indices = canonical_logits.argmax(dim=-1) + const.canonicals_offset
-            return self.predictor(indices, mask=mask)
+        global _profiling_enabled, _profiling_stats
+        
+        if _profiling_enabled:
+            start_time = time.perf_counter()
+            _profiling_stats["compute_score_calls"] += 1
+        
+        device = coords.device
+        B = coords.shape[0]
+        
+        design_mask = feats.get("design_mask")
+        atom_to_token = feats.get("atom_to_token")
+        
+        if design_mask is None or atom_to_token is None:
+            return torch.zeros(B, device=device)
+        
+        # Handle case where feats have batch=1 but coords have batch=B (diffusion_samples > 1)
+        if design_mask.dim() == 1:
+            design_mask = design_mask.unsqueeze(0)
+        if design_mask.shape[0] == 1 and B > 1:
+            design_mask = design_mask.expand(B, -1)
+        
+        if atom_to_token.dim() == 3:
+            atom_to_token_idx = atom_to_token.int().argmax(dim=-1)
+        else:
+            atom_to_token_idx = atom_to_token
+        
+        # Expand atom_to_token_idx if needed
+        if atom_to_token_idx.shape[0] == 1 and B > 1:
+            atom_to_token_idx = atom_to_token_idx.expand(B, -1)
+        
+        batch_scores = []
+        
+        for b in range(B):
+            design_indices = design_mask[b].nonzero(as_tuple=True)[0]
+            
+            if len(design_indices) == 0:
+                batch_scores.append(torch.zeros(1, device=device))
+                continue
+            
+            # Gather all atom indices for designed residues
+            # Build a list of valid residues (those with exactly 14 atoms)
+            valid_residue_atoms = []
+            for token_idx in design_indices:
+                atom_mask = (atom_to_token_idx[b] == token_idx)
+                atom_indices = atom_mask.nonzero(as_tuple=True)[0]
+                if len(atom_indices) == 14:
+                    valid_residue_atoms.append(atom_indices)
+            
+            if len(valid_residue_atoms) == 0:
+                batch_scores.append(torch.zeros(1, device=device))
+                continue
+            
+            if _profiling_enabled:
+                _profiling_stats["residues_processed"] += len(valid_residue_atoms)
+            
+            # Stack all residue atom indices: [N_res, 14]
+            all_atom_indices = torch.stack(valid_residue_atoms)
+            N_res = all_atom_indices.shape[0]
+            
+            # Gather coordinates for all residues at once: [N_res, 14, 3]
+            all_res_coords = coords[b, all_atom_indices]
+            
+            # Split into backbone and sidechain
+            backbone_coords = all_res_coords[:, :4, :]   # [N_res, 4, 3]
+            sidechain_coords = all_res_coords[:, 4:, :]  # [N_res, 10, 3]
+            
+            # Step 1: Compute distances for all residues at once
+            # cdist expects [batch, points1, dim] and [batch, points2, dim]
+            # Output: [N_res, 4, 10]
+            if _profiling_enabled:
+                t0 = time.perf_counter()
+            
+            distances = torch.cdist(backbone_coords, sidechain_coords)  # [N_res, 4, 10]
+            
+            if _profiling_enabled:
+                _profiling_stats["cdist_ms"] += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+            
+            # Step 2: Find closest backbone for each sidechain atom
+            # min over backbone dim (dim=1) → [N_res, 10]
+            min_dists, hard_argmin = distances.min(dim=1)  # both [N_res, 10]
+            
+            # Step 3: Threshold - atoms beyond threshold don't count
+            threshold_mask = (min_dists <= threshold).float()  # [N_res, 10]
+            
+            # STE for threshold
+            soft_threshold = torch.sigmoid((threshold - min_dists) / 0.05)
+            threshold_mask_ste = threshold_mask + (soft_threshold - soft_threshold.detach())
+            
+            # Step 4: Count assignments to each backbone atom
+            # Hard one-hot assignment: [N_res, 10, 4]
+            hard_one_hot = F.one_hot(hard_argmin, num_classes=4).float()
+            
+            # STE for argmin: need to transpose distances for softmax over backbone
+            # distances is [N_res, 4, 10], transpose to [N_res, 10, 4]
+            distances_t = distances.transpose(1, 2)  # [N_res, 10, 4]
+            soft_assignment = F.softmax(-distances_t / 0.01, dim=-1)  # [N_res, 10, 4]
+            assignment_ste = hard_one_hot + (soft_assignment - soft_assignment.detach())
+            
+            # Apply threshold mask and sum to get counts
+            # threshold_mask_ste: [N_res, 10] → [N_res, 10, 1]
+            masked_assignment = assignment_ste * threshold_mask_ste.unsqueeze(-1)  # [N_res, 10, 4]
+            soft_counts = masked_assignment.sum(dim=1)  # [N_res, 4]
+            
+            if _profiling_enabled:
+                _profiling_stats["ste_ms"] += (time.perf_counter() - t0) * 1000
+                t0 = time.perf_counter()
+            
+            # Step 5: Match counts to residue type patterns (vectorized)
+            # soft_counts: [N_res, 4], count_patterns: [20, 4]
+            # Compute L2 distance to each pattern for all residues
+            count_diff = (soft_counts.unsqueeze(1) - self.count_patterns.unsqueeze(0)) ** 2  # [N_res, 20, 4]
+            count_dist = count_diff.sum(dim=-1)  # [N_res, 20]
+            
+            # Hard argmin for pattern matching
+            hard_best_pattern = count_dist.argmin(dim=-1)  # [N_res]
+            
+            # STE: hard in forward, soft in backward
+            soft_pattern_probs = F.softmax(-count_dist / self.temperature, dim=-1)  # [N_res, 20]
+            hard_pattern_one_hot = F.one_hot(hard_best_pattern, num_classes=20).float()  # [N_res, 20]
+            res_probs = hard_pattern_one_hot + (soft_pattern_probs - soft_pattern_probs.detach())
+            
+            if _profiling_enabled:
+                _profiling_stats["pattern_match_ms"] += (time.perf_counter() - t0) * 1000
+            
+            # Compute property score
+            if self.property_type == "hydrophobicity":
+                # res_probs: [N_res, 20], hydrophobicity: [20]
+                residue_scores = (res_probs * self.hydrophobicity).sum(dim=-1)  # [N_res]
+                batch_scores.append(residue_scores.mean().unsqueeze(0))
+            else:
+                batch_scores.append(torch.zeros(1, device=device))
+        
+        if _profiling_enabled:
+            _profiling_stats["compute_score_total_ms"] += (time.perf_counter() - start_time) * 1000
+        
+        return torch.cat(batch_scores)
+    
+    def get_guidance_direction(self) -> float:
+        """Return +1 if higher is better, -1 if lower is better."""
+        return 1.0 if self.higher_is_better else -1.0
 
 
-def create_guidance(
-    predictor: SequencePredictor,
+def create_geometric_guidance(
+    property_type: str = "hydrophobicity",
+    higher_is_better: bool = True,
     guidance_scale: float = 1.0,
+    temperature: float = 0.1,
+    schedule: str = "constant",
+    schedule_start: float = 0.0,
     enabled: bool = True,
     **kwargs,
-) -> DiffusionGuidance:
-    """Factory function to create guidance module.
+) -> GeometricGuidance:
+    """Factory function to create geometric guidance.
     
     Args:
-        predictor: Sequence property predictor
-        guidance_scale: Base scale for guidance
+        property_type: Property to optimize ("hydrophobicity")
+        higher_is_better: Whether to maximize (True) or minimize (False)
+        guidance_scale: Base scale for guidance gradient
+        temperature: Temperature for soft decoding (lower = sharper)
+        schedule: Guidance schedule ("constant", "linear", "cosine", "sigmoid")
+        schedule_start: When to start guidance (0-1 progress)
         enabled: Whether guidance is active
-        **kwargs: Additional arguments for DiffusionGuidance
+        **kwargs: Additional arguments
         
     Returns:
-        Configured DiffusionGuidance instance
+        Configured GeometricGuidance instance
     """
-    return DiffusionGuidance(
-        predictor=predictor,
+    return GeometricGuidance(
+        property_type=property_type,
+        higher_is_better=higher_is_better,
         guidance_scale=guidance_scale,
+        temperature=temperature,
+        schedule=schedule,
+        schedule_start=schedule_start,
         enabled=enabled,
         **kwargs,
     )

@@ -593,27 +593,34 @@ class AtomDiffusion(Module):
             eps = noise_scale * sqrt(noise_var) * torch.randn(shape, device=self.device)
             atom_coords_noisy = atom_coords + eps
 
-            # Check if we need gradients for guidance
+            # Check if guidance should be applied this step
             use_guidance = (
                 guidance is not None 
                 and guidance.enabled 
                 and guidance.get_schedule_weight(step_idx / max(num_sampling_steps - 1, 1)) > 0
             )
             
-            # Apply guidance if enabled and res_type predictions available
             coord_guidance_grad = None
             
+            # Profiling storage (initialized once per sample)
+            if step_idx == 0 and not hasattr(self, '_diffusion_profile'):
+                self._diffusion_profile = {
+                    'network_forward_ms': 0.0,
+                    'score_compute_ms': 0.0,
+                    'backward_ms': 0.0,
+                    'grad_process_ms': 0.0,
+                }
+            
             if use_guidance:
-                # Run WITH gradients to enable backprop for guidance
-                # The entire guidance computation must be inside enable_grad()
-                # because there may be torch.no_grad() contexts higher up
-                atom_coords_noisy_grad = atom_coords_noisy.detach().clone()
-                atom_coords_noisy_grad.requires_grad_(True)
+                import time
                 
-                with torch.enable_grad():
-                    # Forward pass
+                # First run network WITHOUT gradients to get denoised coordinates
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                
+                with torch.no_grad():
                     atom_coords_denoised, net_out = self.preconditioned_network_forward(
-                        atom_coords_noisy_grad,
+                        atom_coords_noisy,
                         t_hat,
                         training=False,
                         network_condition_kwargs=dict(
@@ -621,50 +628,54 @@ class AtomDiffusion(Module):
                             **network_condition_kwargs,
                         ),
                     )
-                    
-                    # Compute guidance gradient
-                    res_type_logits = net_out.get("res_type")
-                    if res_type_logits is not None:
-                        # Get design mask if available
-                        design_mask = feats.get("design_mask", None)
-                        if design_mask is not None:
-                            design_mask = design_mask.bool()
-                        
-                        # Compute property score from logits
-                        scores = guidance.predictor(res_type_logits, mask=design_mask)
-                        
-                        # Compute loss (maximize score in guidance direction)
-                        direction = guidance.predictor.get_guidance_direction()
-                        loss = -direction * scores.sum()
-                        
-                        # Backprop to get gradient w.r.t. coordinates
-                        loss.backward()
-                        
-                        if atom_coords_noisy_grad.grad is not None:
-                            # Scale gradient by guidance scale and schedule
-                            progress = step_idx / max(num_sampling_steps - 1, 1)
-                            schedule_weight = guidance.get_schedule_weight(progress)
-                            coord_guidance_grad = guidance.guidance_scale * schedule_weight * atom_coords_noisy_grad.grad.detach()
-                            
-                            # Clamp if needed
-                            if guidance.clamp_grad is not None:
-                                grad_norm = coord_guidance_grad.norm()
-                                if grad_norm > guidance.clamp_grad:
-                                    coord_guidance_grad = coord_guidance_grad * (guidance.clamp_grad / grad_norm)
-                            
-                            # Store guidance info for logging
-                            if not hasattr(self, '_guidance_info'):
-                                self._guidance_info = []
-                            self._guidance_info.append({
-                                'step': step_idx,
-                                'sigma': t_hat,
-                                'coord_grad_norm': coord_guidance_grad.norm().item(),
-                                'score': scores.detach().mean().item(),
-                            })
                 
-                # Detach outputs for subsequent operations
-                atom_coords_denoised = atom_coords_denoised.detach()
-                atom_coords_noisy = atom_coords_noisy_grad.detach()
+                torch.cuda.synchronize()
+                self._diffusion_profile['network_forward_ms'] += (time.perf_counter() - t0) * 1000
+                
+                # Now compute gradient of property score w.r.t. denoised coordinates directly
+                # This avoids the complex gradient flow through the network
+                atom_coords_denoised_grad = atom_coords_denoised.detach().clone()
+                atom_coords_denoised_grad.requires_grad_(True)
+                
+                with torch.enable_grad():
+                    # Compute property score from denoised coordinates
+                    t0 = time.perf_counter()
+                    scores = guidance.compute_geometric_score(atom_coords_denoised_grad, feats)
+                    torch.cuda.synchronize()
+                    self._diffusion_profile['score_compute_ms'] += (time.perf_counter() - t0) * 1000
+                    
+                    # Compute loss (maximize score in guidance direction)
+                    direction = guidance.get_guidance_direction()
+                    loss = -direction * scores.sum()
+                    
+                    # Backprop to get gradient w.r.t. denoised coordinates
+                    t0 = time.perf_counter()
+                    loss.backward()
+                    torch.cuda.synchronize()
+                    self._diffusion_profile['backward_ms'] += (time.perf_counter() - t0) * 1000
+                    
+                    t0 = time.perf_counter()
+                    if atom_coords_denoised_grad.grad is not None:
+                        progress = step_idx / max(num_sampling_steps - 1, 1)
+                        schedule_weight = guidance.get_schedule_weight(progress)
+                        # Scale by noise level (as in classifier guidance)
+                        coord_guidance_grad = guidance.guidance_scale * schedule_weight * t_hat * atom_coords_denoised_grad.grad.detach()
+                        
+                        if guidance.clamp_grad is not None:
+                            grad_norm = coord_guidance_grad.norm()
+                            if grad_norm > guidance.clamp_grad:
+                                coord_guidance_grad = coord_guidance_grad * (guidance.clamp_grad / grad_norm)
+                        
+                        if not hasattr(self, '_guidance_info'):
+                            self._guidance_info = []
+                        self._guidance_info.append({
+                            'step': step_idx,
+                            'sigma': t_hat,
+                            'coord_grad_norm': coord_guidance_grad.norm().item(),
+                            'score': scores.detach().mean().item(),
+                        })
+                    torch.cuda.synchronize()
+                    self._diffusion_profile['grad_process_ms'] += (time.perf_counter() - t0) * 1000
             else:
                 # Standard no-grad inference
                 with torch.no_grad():
@@ -696,6 +707,8 @@ class AtomDiffusion(Module):
             )
             
             # Apply guidance gradient to nudge coordinates toward desired properties
+            # Gradient is ∂(-scores)/∂denoised_coords, pointing toward decreasing scores
+            # Subtracting moves toward increasing scores
             if coord_guidance_grad is not None:
                 atom_coords_next = atom_coords_next - coord_guidance_grad
 
@@ -721,6 +734,11 @@ class AtomDiffusion(Module):
         # Include guidance info if guidance was used
         if guidance is not None and hasattr(self, '_guidance_info'):
             result['guidance_info'] = self._guidance_info
+        
+        # Include profiling info
+        if hasattr(self, '_diffusion_profile'):
+            result['diffusion_profile'] = self._diffusion_profile
+            del self._diffusion_profile  # Reset for next sample
 
         return result
 
