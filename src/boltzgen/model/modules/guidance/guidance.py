@@ -330,7 +330,9 @@ class GeometricGuidance(nn.Module):
             # Step 5: Match counts to residue type patterns (vectorized)
             # soft_counts: [N_res, 4], count_patterns: [20, 4]
             # Compute L2 distance to each pattern for all residues
-            count_diff = (soft_counts.unsqueeze(1) - self.count_patterns.unsqueeze(0)) ** 2  # [N_res, 20, 4]
+            # Move patterns to same device as input
+            count_patterns = self.count_patterns.to(soft_counts.device)
+            count_diff = (soft_counts.unsqueeze(1) - count_patterns.unsqueeze(0)) ** 2  # [N_res, 20, 4]
             count_dist = count_diff.sum(dim=-1)  # [N_res, 20]
             
             # Hard argmin for pattern matching
@@ -347,7 +349,8 @@ class GeometricGuidance(nn.Module):
             # Compute property score
             if self.property_type == "hydrophobicity":
                 # res_probs: [N_res, 20], hydrophobicity: [20]
-                residue_scores = (res_probs * self.hydrophobicity).sum(dim=-1)  # [N_res]
+                hydro = self.hydrophobicity.to(res_probs.device)
+                residue_scores = (res_probs * hydro).sum(dim=-1)  # [N_res]
                 batch_scores.append(residue_scores.mean().unsqueeze(0))
             else:
                 batch_scores.append(torch.zeros(1, device=device))

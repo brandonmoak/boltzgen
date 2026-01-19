@@ -1,0 +1,19 @@
+# Realistic loop redesign example for 1G13
+# Instead of designing an entire new protein, we redesign a specific loop region
+# This is more typical for protein engineering (e.g., improving binding affinity)
+
+entities:
+  - file:
+      path: 1g13.cif
+      
+      # Include chain A from the structure
+      include: 
+        - chain:
+            id: A
+      
+      # Design only a loop region (residues 30-45, about 16 residues)
+      # This represents a typical "loop redesign" scenario
+      design:
+        - chain:
+            id: A
+            res_index: 30..45

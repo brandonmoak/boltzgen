@@ -35,6 +35,10 @@ from boltzgen.model.modules.guidance.guidance import (
     get_profiling_stats,
 )
 
+from boltzgen.model.modules.guidance.utils import (
+    extract_sequence_from_sample,
+)
+
 __all__ = [
     # Sequence utilities
     "logits_to_aa_string",
@@ -60,4 +64,6 @@ __all__ = [
     "enable_profiling",
     "reset_profiling", 
     "get_profiling_stats",
+    # Output utilities
+    "extract_sequence_from_sample",
 ]

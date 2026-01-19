@@ -1293,6 +1293,7 @@ class Boltz(LightningModule):
                     if "return_z_feats" in self.predict_args
                     else False
                 ),
+                guidance=self.predict_args.get("guidance"),  # Support guidance steering
             )
             pred_dict = {"exception": False}
             pred_dict.update(feat_masked)
