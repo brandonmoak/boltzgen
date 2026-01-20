@@ -1324,6 +1324,11 @@ class Boltz(LightningModule):
             if not self.inverse_fold:
                 pred_dict["coords_traj"] = out["coords_traj"]
                 pred_dict["x0_coords_traj"] = out["x0_coords_traj"]
+            
+            # Pass through guidance info for diagnostics
+            if "guidance_info" in out:
+                pred_dict["guidance_info"] = out["guidance_info"]
+            
             if self.confidence_prediction:
                 # pred_dict["confidence"] = out.get("ablation_confidence", None)
                 pred_dict["pde"] = out["pde"]

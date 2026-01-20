@@ -301,6 +301,17 @@ class GeometricGuidance(nn.Module):
             # min over backbone dim (dim=1) → [N_res, 10]
             min_dists, hard_argmin = distances.min(dim=1)  # both [N_res, 10]
             
+            # NOISE DETECTION: If distances are too large, coordinates are noise
+            # Return neutral score (0) instead of biased prediction toward TRP
+            # Typical bond lengths are 1-2Å; if mean min dist > 5Å, it's noise
+            mean_min_dist = min_dists.mean()
+            if mean_min_dist > 5.0:
+                # Return zero with gradient connection to coords for proper backprop
+                # Use a tiny contribution from coords to maintain gradient flow
+                # unsqueeze(0) ensures shape [1] to match other batch_scores entries
+                batch_scores.append((coords[b, 0, 0] * 0.0).unsqueeze(0))
+                continue
+            
             # Step 3: Threshold - atoms beyond threshold don't count
             threshold_mask = (min_dists <= threshold).float()  # [N_res, 10]
             
