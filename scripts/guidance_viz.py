@@ -565,6 +565,7 @@ def compute_trajectory_hydrophobicity(
 def plot_trajectory_hydrophobicity_comparison(
     traj_unguided: Dict[str, np.ndarray],
     traj_guided: Dict[str, np.ndarray],
+    traj_guided_x0: Optional[Dict[str, np.ndarray]] = None,
     title: str = "Hydrophobicity Through Diffusion",
     show_individual: bool = False,
 ):
@@ -574,7 +575,9 @@ def plot_trajectory_hydrophobicity_comparison(
     
     Args:
         traj_unguided: Output from compute_trajectory_hydrophobicity for unguided run
-        traj_guided: Output from compute_trajectory_hydrophobicity for guided run
+        traj_guided: Output from compute_trajectory_hydrophobicity for guided run (noisy coords)
+        traj_guided_x0: Output from compute_trajectory_hydrophobicity for guided run's 
+                        clean predicted coords (x̂_0) - this is what reconstruction guidance optimizes
         title: Plot title
         show_individual: If True, also plot individual sample trajectories as thin lines
         
@@ -587,7 +590,7 @@ def plot_trajectory_hydrophobicity_comparison(
     
     n_samples_str = ""
     
-    # Plot unguided
+    # Plot unguided (blue)
     if 'scores_mean' in traj_unguided and len(traj_unguided['scores_mean']) > 0:
         steps = traj_unguided['steps']
         mean = traj_unguided['scores_mean']
@@ -606,7 +609,7 @@ def plot_trajectory_hydrophobicity_comparison(
         
         n_samples_str = f"n={n_samples}"
     
-    # Plot guided
+    # Plot guided noisy coords (red)
     if 'scores_mean' in traj_guided and len(traj_guided['scores_mean']) > 0:
         steps = traj_guided['steps']
         mean = traj_guided['scores_mean']
@@ -616,12 +619,29 @@ def plot_trajectory_hydrophobicity_comparison(
         # Shaded std region
         ax.fill_between(steps, mean - std, mean + std, color='red', alpha=0.2)
         # Mean line
-        ax.plot(steps, mean, 'r-', linewidth=2, label=f'Guided (n={n_samples})')
+        ax.plot(steps, mean, 'r-', linewidth=2, label=f'Guided noisy (n={n_samples})')
         
         # Individual trajectories
         if show_individual and 'scores_all' in traj_guided:
             for i in range(traj_guided['scores_all'].shape[1]):
                 ax.plot(steps, traj_guided['scores_all'][:, i], 'r-', alpha=0.1, linewidth=0.5)
+    
+    # Plot guided x0 (clean predicted) - this is what we're optimizing! (green)
+    if traj_guided_x0 is not None and 'scores_mean' in traj_guided_x0 and len(traj_guided_x0['scores_mean']) > 0:
+        steps = traj_guided_x0['steps']
+        mean = traj_guided_x0['scores_mean']
+        std = traj_guided_x0['scores_std']
+        n_samples = traj_guided_x0.get('n_samples', 1)
+        
+        # Shaded std region
+        ax.fill_between(steps, mean - std, mean + std, color='green', alpha=0.2)
+        # Mean line - dashed to distinguish
+        ax.plot(steps, mean, 'g--', linewidth=2, label=f'Guided x̂₀ (optimized, n={n_samples})')
+        
+        # Individual trajectories
+        if show_individual and 'scores_all' in traj_guided_x0:
+            for i in range(traj_guided_x0['scores_all'].shape[1]):
+                ax.plot(steps, traj_guided_x0['scores_all'][:, i], 'g--', alpha=0.1, linewidth=0.5)
     
     # Find max step for x-axis
     max_step = 0
@@ -629,22 +649,25 @@ def plot_trajectory_hydrophobicity_comparison(
         max_step = max(max_step, max(traj_unguided['steps']))
     if 'steps' in traj_guided and len(traj_guided['steps']) > 0:
         max_step = max(max_step, max(traj_guided['steps']))
+    if traj_guided_x0 is not None and 'steps' in traj_guided_x0 and len(traj_guided_x0['steps']) > 0:
+        max_step = max(max_step, max(traj_guided_x0['steps']))
     
     ax.set_xlabel('Diffusion Step')
     ax.set_ylabel('Hydrophobicity Score')
     ax.set_title(f"{title}\n(mean ± std across all samples)")
     ax.set_xlim(0, max_step if max_step > 0 else 1)
-    ax.legend()
+    ax.legend(loc='best')
     ax.grid(True, alpha=0.3)
     ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
     
     # Add final value annotations
+    y_offset = 5
     if 'scores_mean' in traj_unguided and len(traj_unguided['scores_mean']) > 0:
         final_mean = traj_unguided['scores_mean'][-1]
         final_std = traj_unguided['scores_std'][-1]
         ax.annotate(f'{final_mean:.2f}±{final_std:.2f}', 
                    xy=(traj_unguided['steps'][-1], final_mean),
-                   xytext=(5, 5), textcoords='offset points', color='blue', fontsize=9)
+                   xytext=(5, y_offset), textcoords='offset points', color='blue', fontsize=9)
     
     if 'scores_mean' in traj_guided and len(traj_guided['scores_mean']) > 0:
         final_mean = traj_guided['scores_mean'][-1]
@@ -652,6 +675,13 @@ def plot_trajectory_hydrophobicity_comparison(
         ax.annotate(f'{final_mean:.2f}±{final_std:.2f}', 
                    xy=(traj_guided['steps'][-1], final_mean),
                    xytext=(5, -10), textcoords='offset points', color='red', fontsize=9)
+    
+    if traj_guided_x0 is not None and 'scores_mean' in traj_guided_x0 and len(traj_guided_x0['scores_mean']) > 0:
+        final_mean = traj_guided_x0['scores_mean'][-1]
+        final_std = traj_guided_x0['scores_std'][-1]
+        ax.annotate(f'{final_mean:.2f}±{final_std:.2f}', 
+                   xy=(traj_guided_x0['steps'][-1], final_mean),
+                   xytext=(5, -25), textcoords='offset points', color='green', fontsize=9)
     
     plt.tight_layout()
     return fig

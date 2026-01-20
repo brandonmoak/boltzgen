@@ -94,6 +94,7 @@ class GeometricGuidance(nn.Module):
         schedule_end: float = 1.0,
         clamp_grad: Optional[float] = None,
         enabled: bool = True,
+        use_reconstruction_guidance: bool = True,
     ):
         """Initialize geometric guidance.
         
@@ -111,6 +112,10 @@ class GeometricGuidance(nn.Module):
             schedule_end: When guidance reaches full strength
             clamp_grad: Max gradient norm
             enabled: Whether guidance is active
+            use_reconstruction_guidance: If True, use proper Reconstruction Guidance (DPS)
+                which backpropagates through the network for ∇_{x_t} Score(x̂_0(x_t)).
+                If False, use simple guidance that only computes ∇_{x̂_0} Score(x̂_0).
+                Default True (recommended for best results).
         """
         super().__init__()
         self.property_type = property_type
@@ -122,6 +127,7 @@ class GeometricGuidance(nn.Module):
         self.schedule_end = schedule_end
         self.clamp_grad = clamp_grad
         self.enabled = enabled
+        self.use_reconstruction_guidance = use_reconstruction_guidance
         
         self._build_patterns()
     
@@ -384,6 +390,7 @@ def create_geometric_guidance(
     schedule: str = "constant",
     schedule_start: float = 0.0,
     enabled: bool = True,
+    use_reconstruction_guidance: bool = True,
     **kwargs,
 ) -> GeometricGuidance:
     """Factory function to create geometric guidance.
@@ -396,6 +403,11 @@ def create_geometric_guidance(
         schedule: Guidance schedule ("constant", "linear", "cosine", "sigmoid")
         schedule_start: When to start guidance (0-1 progress)
         enabled: Whether guidance is active
+        use_reconstruction_guidance: If True (default), use proper Reconstruction 
+            Guidance (DPS) which backpropagates through the denoising network.
+            This computes ∇_{x_t} Score(x̂_0(x_t)) - the mathematically correct
+            gradient for diffusion guidance. If False, use simpler (faster but 
+            less accurate) guidance that only computes ∇_{x̂_0} Score(x̂_0).
         **kwargs: Additional arguments
         
     Returns:
@@ -409,5 +421,6 @@ def create_geometric_guidance(
         schedule=schedule,
         schedule_start=schedule_start,
         enabled=enabled,
+        use_reconstruction_guidance=use_reconstruction_guidance,
         **kwargs,
     )
